@@ -1,0 +1,184 @@
+package com.realu.core
+
+import com.realu.core.data.BarSeries
+import com.realu.core.data.Board
+import com.realu.core.data.Dates
+import com.realu.core.data.StockCode
+import com.realu.core.feature.FeatureDefs
+import com.realu.core.feature.FeatureEngine
+import com.realu.core.indicator.Ind
+import com.realu.core.model.GbdtModel
+import com.realu.core.model.Tree
+import com.realu.core.strategy.ExitReason
+import com.realu.core.strategy.ExitRule
+import com.realu.core.strategy.LabelOutcome
+import com.realu.core.strategy.LabelParams
+import com.realu.core.strategy.Labeler
+import com.realu.core.strategy.TradeSimulator
+import com.realu.core.tdx.ExRightsAdjuster
+import com.realu.core.tdx.TdxDayReader
+import com.realu.core.tdx.TdxTxtReader
+import com.realu.core.util.Json
+import com.realu.core.util.asJsonMap
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import kotlin.math.abs
+import kotlin.test.Test
+import kotlin.test.assertEquals
+import kotlin.test.assertFalse
+import kotlin.test.assertNotNull
+import kotlin.test.assertNull
+import kotlin.test.assertTrue
+
+class CoreTest {
+
+    private fun series(close: DoubleArray, open: DoubleArray = close, high: DoubleArray? = null, low: DoubleArray? = null,
+                       code: StockCode = StockCode("sh", "600000")): BarSeries {
+        val n = close.size
+        val h = high ?: DoubleArray(n) { maxOf(open[it], close[it]) }
+        val l = low ?: DoubleArray(n) { minOf(open[it], close[it]) }
+        val dates = IntArray(n) { Dates.plusDays(20200101, it.toLong()) }
+        return BarSeries(code, "", dates, open, h, l, close, DoubleArray(n) { 1e6 }, DoubleArray(n) { 1e6 * close[it] })
+    }
+
+    @Test
+    fun stockCodeParsing() {
+        assertEquals(StockCode("sh", "600000"), StockCode.parse("sh600000.day"))
+        assertEquals(StockCode("sz", "300750"), StockCode.parse("SZ#300750.txt"))
+        assertEquals(StockCode("sz", "000001"), StockCode.parse("000001.SZ"))
+        assertEquals(StockCode("bj", "830799"), StockCode.parse("830799"))
+        assertEquals(Board.CHINEXT, StockCode("sz", "300750").board)
+        assertEquals(Board.INDEX, StockCode("sh", "000001").board)
+        assertEquals(0.10, StockCode("sz", "300750").limitPct(20200821))
+        assertEquals(0.20, StockCode("sz", "300750").limitPct(20200824))
+        assertNull(StockCode.parse("readme.txt"))
+    }
+
+    @Test
+    fun dayFileRoundTripAndBadRecords() {
+        val buf = ByteBuffer.allocate(32 * 3 + 5).order(ByteOrder.LITTLE_ENDIAN)
+        fun rec(d: Int, o: Int, h: Int, l: Int, c: Int) {
+            buf.putInt(d); buf.putInt(o); buf.putInt(h); buf.putInt(l); buf.putInt(c)
+            buf.putFloat(1.5e8f); buf.putInt(123456); buf.putInt(0)
+        }
+        rec(20240102, 1000, 1100, 990, 1050)
+        rec(20240101, 1000, 1100, 990, 1050) // 乱序,应跳过
+        rec(20240103, 1050, 1200, 1040, 1150)
+        val r = TdxDayReader.parse(buf.array(), StockCode("sh", "600000"))
+        val s = assertNotNull(r.series)
+        assertEquals(2, s.size)
+        assertEquals(10.5, s.close[0], 1e-9)
+        assertEquals(11.5, s.close[1], 1e-9)
+        assertEquals(123456.0, s.volume[1])
+        assertTrue(r.warnings.any { it.contains("32") })
+        assertTrue(r.warnings.any { it.contains("跳过 1") })
+    }
+
+    @Test
+    fun txtExportInGbk() {
+        val text = "600000 浦发银行 日线 前复权\r\n      日期\t开盘\t最高\t最低\t收盘\t成交量\t成交额\r\n" +
+            "2024/01/02\t10.00\t10.50\t9.90\t10.20\t1000000\t10200000.00\r\n" +
+            "2024/01/03\t10.20\t10.80\t10.10\t10.70\t1500000\t16050000.00\r\n数据来源:通达信\r\n"
+        val r = TdxTxtReader.parse(text.toByteArray(TdxTxtReader.GBK), "SH#600000.txt")
+        val s = assertNotNull(r.series)
+        assertEquals("浦发银行", s.name)
+        assertEquals(2, s.size)
+        assertEquals(20240103, s.date[1])
+        assertEquals(10.70, s.close[1], 1e-9)
+        // UTF-8 文件也能读
+        assertEquals("浦发银行", TdxTxtReader.parse(text.toByteArray(Charsets.UTF_8), "SH#600000.txt").series!!.name)
+    }
+
+    @Test
+    fun exRightsHeuristic() {
+        // 第 3 天 10 送 10:开盘价腰斩
+        val close = doubleArrayOf(20.0, 20.4, 10.3, 10.5)
+        val open = doubleArrayOf(20.0, 20.0, 10.2, 10.3)
+        val s = series(close, open)
+        assertEquals(1, ExRightsAdjuster.forwardAdjust(s))
+        assertEquals(20.4 * 10.2 / 20.4, s.close[1], 1e-9)
+        assertTrue(abs(s.close[1] - s.open[2]) < 1e-9)
+    }
+
+    @Test
+    fun indicators() {
+        val x = doubleArrayOf(1.0, 2.0, 3.0, 4.0, 5.0)
+        assertTrue(Ind.ma(x, 3)[1].isNaN())
+        assertEquals(4.0, Ind.ma(x, 3)[4])
+        assertEquals(5.0, Ind.hhv(x, 2)[4])
+        assertEquals(4.0, Ind.llv(x, 2)[4])
+        val up = DoubleArray(30) { 10.0 + it }
+        assertEquals(100.0, Ind.rsi(up, 6)[29], 1e-9)
+    }
+
+    @Test
+    fun labelAndTradeRespectTPlusOneAndStop() {
+        // 信号日 0,买入日 1 开盘 10 元;买入日当天最低 8.5 不能止损(T+1);次日跌破 9.2 止损
+        val close = doubleArrayOf(10.0, 9.0, 9.0, 9.5)
+        val open = doubleArrayOf(10.0, 10.0, 9.5, 9.0)
+        val low = doubleArrayOf(10.0, 8.5, 9.3, 9.0)
+        val high = doubleArrayOf(10.0, 10.0, 9.5, 9.6)
+        val s = series(close, open, high, low)
+        val t = assertNotNull(TradeSimulator.simulate(s, 0, ExitRule(stopLoss = 0.08, maxHoldDays = 10)))
+        assertEquals(ExitReason.STOP_LOSS, t.reason)
+        assertEquals(3, t.exitIndex)
+        assertEquals(9.0, t.exitPrice, 1e-9) // 跳空低开到 9.0,以开盘价成交
+        val rising = DoubleArray(45) { 10.0 * Math.pow(1.02, it.toDouble()) }
+        val lr = Labeler.label(series(rising, DoubleArray(45) { rising[it] * 0.99 }), 0, LabelParams(horizon = 40, target = 0.30, stop = 0.08))
+        assertEquals(LabelOutcome.HIT, lr.outcome)
+    }
+
+    @Test
+    fun trailingStopUsesPreviousPeak() {
+        val n = 12
+        val close = DoubleArray(n) { if (it <= 6) 10.0 * (1 + 0.05 * it) else 13.0 - (it - 6) * 0.5 }
+        val s = series(close, close.copyOf())
+        val t = assertNotNull(TradeSimulator.simulate(s, 0, ExitRule(stopLoss = 0.08, trailingActivate = 0.15, trailingDrawdown = 0.10, maxHoldDays = 30)))
+        assertEquals(ExitReason.TRAILING, t.reason)
+        // 买入 10.5,最高 13.0,回撤 10% 线 11.7;第 9 天收在 11.5 触发,按 11.5 成交
+        assertEquals(9, t.exitIndex)
+        assertEquals(11.5 / 10.5 - 1, t.ret, 1e-9)
+    }
+
+    @Test
+    fun oneWordLimitUpIsNotBuyable() {
+        val close = doubleArrayOf(10.0, 11.0, 11.5)
+        val open = doubleArrayOf(10.0, 11.0, 11.0)
+        val s = series(close, open, doubleArrayOf(10.0, 11.0, 11.6), doubleArrayOf(10.0, 11.0, 11.0))
+        assertTrue(s.isOneWordLimitUp(1))
+        assertNull(TradeSimulator.simulate(s, 0, ExitRule()))
+    }
+
+    @Test
+    fun featuresHaveExpectedShapeAndNoFutureLeak() {
+        val n = 400
+        val rnd = java.util.Random(1)
+        val close = DoubleArray(n).also { var p = 10.0; for (i in 0 until n) { p *= 1 + rnd.nextGaussian() * 0.02; it[i] = p } }
+        val s = series(close, close.copyOf())
+        val full = FeatureEngine.compute(s)
+        assertEquals(FeatureDefs.COUNT, full.values.size)
+        // 截断到第 300 天重新计算,第 299 天的特征必须完全相同(不使用未来数据)
+        val cut = FeatureEngine.compute(s.slice(0, 300))
+        for (f in 0 until FeatureDefs.COUNT) {
+            val a = full.values[f][299]; val b = cut.values[f][299]
+            assertTrue((a.isNaN() && b.isNaN()) || a == b, "特征 ${FeatureDefs.NAMES[f]} 使用了未来数据:$a vs $b")
+        }
+    }
+
+    @Test
+    fun jsonAndTreeRoundTrip() {
+        val tree = Tree(intArrayOf(0, -1, -1), doubleArrayOf(0.5, 0.0, 0.0), booleanArrayOf(true, false, false),
+            intArrayOf(1, -1, -1), intArrayOf(2, -1, -1), doubleArrayOf(0.0, -0.3, 0.4))
+        val text = Json.write(tree.toJson())
+        val back = Tree.fromJson(Json.parse(text).asJsonMap())
+        val m = GbdtModel(0.1, listOf(back))
+        val x = FloatArray(FeatureDefs.COUNT)
+        x[0] = 0.4f; assertEquals(0.1 - 0.3, m.rawScore(x), 1e-6)
+        x[0] = 0.6f; assertEquals(0.1 + 0.4, m.rawScore(x), 1e-6)
+        x[0] = Float.NaN; assertEquals(0.1 - 0.3, m.rawScore(x), 1e-6) // 缺失值走左
+        val (bias, contrib) = m.contributions(floatArrayOf(0.6f) + FloatArray(FeatureDefs.COUNT - 1))
+        assertEquals(m.rawScore(floatArrayOf(0.6f) + FloatArray(FeatureDefs.COUNT - 1)), bias + contrib.sum(), 1e-9)
+        assertFalse(Json.write(mapOf("a" to Double.NaN)).contains("NaN"))
+        assertEquals("中文\n\"x\"", (Json.parse(Json.write(mapOf("s" to "中文\n\"x\""))).asJsonMap())["s"])
+    }
+}
