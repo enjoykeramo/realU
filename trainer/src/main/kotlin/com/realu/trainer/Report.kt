@@ -24,6 +24,7 @@ object Report {
         line("# ${model.name} 模型检验报告")
         line()
         line("- 生成时间:${model.createdAt}")
+        line("- 程序:${versionText()}")
         line("- 结论:**${s.verdict}**")
         line("- 目标:${label.describe()}")
         line("- 准确率:已完成的交易周期中,按选定卖出规则卖出时(收盘价)扣成本 ${pct(label.cost, 1)} 后盈利 ≥ ${pct(label.target, 0)} 的比例;同一只股票 $cooldown 个交易日内只计第一次信号;数据末尾尚未卖出的周期单独列为\"未完成\",不计入")

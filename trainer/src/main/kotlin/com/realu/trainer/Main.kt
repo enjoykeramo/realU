@@ -76,6 +76,7 @@ private fun runDir(cfg: Config, tag: String): File {
 }
 
 private fun banner(cfg: Config) {
+    Console.info(versionText())
     Console.info("配置文件:${cfg.file?.absolutePath}")
     Console.info("JVM 最大内存 ${MemoryGuard.maxMb()}MB,线程 ${cfg.threads},控制台编码 ${Console.charset}")
     if (MemoryGuard.maxMb() < 2048) Console.warn("JVM 最大内存不足 2GB,全市场训练可能内存不足,建议 -Xmx6g 以上")
@@ -198,7 +199,7 @@ private fun demo(args: Array<String>) {
     Console.info("把配置中的 tdx.vipdoc 指向 ${File(dir, "vipdoc").absolutePath} 即可试跑 train,用于验证环境;模拟数据的结果没有任何投资意义。")
 }
 
-private fun versionText(): String {
+fun versionText(): String {
     val p = java.util.Properties()
     object {}.javaClass.getResourceAsStream("/realu-build.properties")?.use { p.load(it) }
     return "realU trainer ${p.getProperty("version", "dev")}  build ${p.getProperty("buildTime", "unknown")}  " +
