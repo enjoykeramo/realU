@@ -12,17 +12,19 @@
 
 ### 编译(每次改完代码后)
 
-需要 JDK 17 或更高版本(自带 jpackage),`JAVA_HOME` 指向 JDK 或 `java` 在 PATH 中;Gradle 可选(没有就用自带的 `gradlew.bat`)。
+需要:本机已安装的 Gradle 8.x(项目不带 Gradle Wrapper,不会下载 Gradle)和 JDK 17 或更高版本(自带 jpackage;`JAVA_HOME` 指向 JDK)。
+
+在项目根目录执行:
 
 ```bat
-build.bat                     :: 编译并打包到 dist\realu
-build.bat test                :: 先跑单元测试再打包
-build.bat D:\tools\realu       :: 打包到指定目录
+gradle exe                              :: 编译并打包到 dist\realu
+gradle test exe                         :: 先跑单元测试再打包
+gradle exe -PoutDir=D:\tools\realu       :: 打包到指定目录
 ```
 
-得到绿色版 `realu.exe` + 自带 Java 运行时(目标电脑不用装 Java)。重复编译只替换程序部分(`app`、`runtime`、`realu.exe`、`docs`),
-输出目录里你自己的 `config.properties`、`out\` 训练结果都会保留;第一次编译时自动从模板生成 `config.properties`。
-编译结束会运行 `realu.exe version`,显示的构建时间应与本次编译一致。
+得到绿色版 `dist\realu\realu.exe` + 自带 Java 运行时(目标电脑不用装 Java)。重复打包只替换程序部分(`app`、`runtime`、`realu.exe`、`docs`),
+输出目录里你自己的 `config.properties`、`out\` 训练结果都会保留;第一次打包时自动从模板生成 `config.properties`。
+打包结束会运行 `realu.exe version`,显示的构建时间应与本次编译一致。
 
 ### 使用
 
@@ -55,7 +57,7 @@ realu.exe demo demo-data                                                        
 ```
 
 内存:`realu.exe` 默认最多使用物理内存的 65%。全市场 2010 年至今约需 3–6GB。
-没有 JDK 的电脑也可以用 `gradlew.bat :trainer:winDist` 生成的 zip(`realu.bat` + jar,需要目标电脑安装 Java 17+)。
+也可以用 `gradle winDist` 生成 zip(`realu.bat` + jar,目标电脑需要安装 Java 17+)。
 
 退出码:0 达标;10 已导出但未达标;2 配置/数据错误;3 内存不足;1 其他异常。
 
@@ -70,6 +72,7 @@ realu.exe demo demo-data                                                        
 ## 开发
 
 ```bash
-./gradlew test               # 单元测试(含"训练预测 = 导出模型预测"一致性校验、未来函数校验)
-./gradlew :trainer:fatJar    # 生成 trainer/build/libs/realu-trainer.jar
+gradle test                  # 单元测试(含"训练预测 = 导出模型预测"一致性校验、未来函数校验)
+gradle exe                   # 打包 realu.exe
+gradle :trainer:fatJar       # 生成 trainer/build/libs/realu-trainer.jar
 ```
