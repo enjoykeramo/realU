@@ -17,6 +17,8 @@
 在项目根目录执行:
 
 ```bat
+build.bat                               :: 等同 gradle exe
+build.bat test                          :: 等同 gradle test exe
 gradle exe                              :: 编译并打包到 dist\realu
 gradle test exe                         :: 先跑单元测试再打包
 gradle exe -PoutDir=D:\tools\realu       :: 打包到指定目录
