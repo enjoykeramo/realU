@@ -1,4 +1,5 @@
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+import java.time.LocalDateTime
 
 plugins {
     kotlin("jvm")
@@ -24,6 +25,21 @@ application {
     applicationName = "realu-trainer"
     applicationDefaultJvmArgs = listOf("-Xmx6g", "-Dfile.encoding=UTF-8", "-Dstdout.encoding=UTF-8", "-Dstderr.encoding=UTF-8")
 }
+
+// 构建信息(版本 + 构建时间),供 `realu version` 显示,用来确认运行的是不是最新编译的程序
+val buildInfoDir = layout.buildDirectory.dir("generated/buildinfo")
+val buildInfo = tasks.register("buildInfo") {
+    val out = buildInfoDir
+    val ver = project.version.toString()
+    outputs.dir(out)
+    outputs.upToDateWhen { false }
+    doLast {
+        val f = out.get().file("realu-build.properties").asFile
+        f.parentFile.mkdirs()
+        f.writeText("version=$ver\nbuildTime=${LocalDateTime.now().withNano(0)}\n")
+    }
+}
+sourceSets.main { resources.srcDir(buildInfo) }
 
 // 单文件可执行 jar:java -jar realu-trainer.jar train config.properties
 tasks.register<Jar>("fatJar") {

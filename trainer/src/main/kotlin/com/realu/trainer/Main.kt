@@ -12,7 +12,8 @@ private const val USAGE = """
 realU 主升初期模型训练器
 
 用法:
-  realu-trainer train    <config.properties>              训练 + 历史检验 + 导出模型
+  realu-trainer version                                   显示版本与构建时间
+  realu-trainer train    [config.properties]              训练 + 历史检验 + 导出模型(默认读当前目录的 config.properties)
   realu-trainer check    <config.properties>              数据体检(文件数、日期范围、坏数据)
   realu-trainer backtest <config.properties> <model.json> [起始yyyyMMdd] [结束yyyyMMdd]
   realu-trainer predict  <config.properties> <model.json> [日期yyyyMMdd]   列出某日信号
@@ -29,9 +30,12 @@ fun main(args: Array<String>) {
     val code = try {
         when (cmd) {
             "demo" -> { Console.init(); demo(args); 0 }
+            "version", "-v", "--version" -> { Console.init(); Console.raw(versionText()); 0 }
             else -> {
-                val cfg = Config.load(File(args.getOrNull(1) ?: error("缺少配置文件参数")))
-                Console.init(cfg.consoleEncoding)
+                // 不写配置文件时使用当前目录下的 config.properties
+                Console.init() // 先初始化,读配置出错时的提示也能正常显示中文
+                val cfg = Config.load(File(args.getOrNull(1) ?: "config.properties"))
+                if (!cfg.consoleEncoding.equals("auto", true)) Console.init(cfg.consoleEncoding)
                 when (cmd) {
                     "train" -> train(cfg)
                     "check" -> { check(cfg); 0 }
@@ -192,4 +196,11 @@ private fun demo(args: Array<String>) {
     val n = SyntheticData.writeTdx(dir, stocks = opt("--stocks", 300), days = opt("--days", 2600), seed = 7, withHqCache = withHq)
     Console.info("已在 ${dir.absolutePath} 生成 $n 个模拟 .day 文件(含指数 sh000001)" + if (withHq) "与 T0002/hq_cache 行业/概念文件。" else "。")
     Console.info("把配置中的 tdx.vipdoc 指向 ${File(dir, "vipdoc").absolutePath} 即可试跑 train,用于验证环境;模拟数据的结果没有任何投资意义。")
+}
+
+private fun versionText(): String {
+    val p = java.util.Properties()
+    object {}.javaClass.getResourceAsStream("/realu-build.properties")?.use { p.load(it) }
+    return "realU trainer ${p.getProperty("version", "dev")}  build ${p.getProperty("buildTime", "unknown")}  " +
+        "Java ${System.getProperty("java.version")}"
 }

@@ -10,19 +10,34 @@
 
 ## 在 Windows 上使用
 
-1. 安装 Java 17 或更高版本(如 [Adoptium Temurin](https://adoptium.net/)),确认 `java -version` 可用。
-2. 构建分发包(或直接使用别人构建好的 zip):
-   ```bat
-   gradlew.bat :trainer:winDist
-   ```
-   得到 `trainer\build\distributions\realu-trainer-win.zip`,解压到任意目录(路径可含中文)。
-3. 在通达信中下载完整的盘后日线数据("系统 → 盘后数据下载 → 日线和实时行情数据",起始日期尽量早)。
+### 编译(每次改完代码后)
+
+需要 JDK 17 或更高版本(自带 jpackage),`JAVA_HOME` 指向 JDK 或 `java` 在 PATH 中;Gradle 可选(没有就用自带的 `gradlew.bat`)。
+
+```bat
+build.bat                     :: 编译并打包到 dist\realu
+build.bat test                :: 先跑单元测试再打包
+build.bat D:\tools\realu       :: 打包到指定目录
+```
+
+得到绿色版 `realu.exe` + 自带 Java 运行时(目标电脑不用装 Java)。重复编译只替换程序部分(`app`、`runtime`、`realu.exe`、`docs`),
+输出目录里你自己的 `config.properties`、`out\` 训练结果都会保留;第一次编译时自动从模板生成 `config.properties`。
+编译结束会运行 `realu.exe version`,显示的构建时间应与本次编译一致。
+
+### 使用
+
+1. 在通达信中下载完整的盘后日线数据("系统 → 盘后数据下载 → 日线和实时行情数据",起始日期尽量早)。
    行业/概念板块:通达信目录下的 `T0002\hq_cache` 会被自动找到(就在 `vipdoc` 旁边);只有 vipdoc 时自动改用"收益相关性聚类"板块。
-4. 复制 `config.example.properties` 为 `config.properties`,至少修改:
+2. 编辑输出目录里的 `config.properties`,至少修改:
    - `tdx.vipdoc=` 通达信安装目录下的 `vipdoc`(如 `C:\new_tdx\vipdoc`)
    - `split.trainEnd` / `split.validEnd`:训练、验证、测试三段时间的分界
-5. 双击 `check.bat` 做数据体检,再双击 `train.bat` 开始训练。
-6. 结果在 `out\train-时间戳\`:
+3. 在输出目录打开命令行:
+   ```bat
+   realu.exe check        :: 数据体检
+   realu.exe train        :: 训练 + 历史检验 + 导出模型
+   ```
+   不写配置文件时默认读当前目录的 `config.properties`。
+4. 结果在 `out\train-时间戳\`:
    | 文件 | 内容 |
    |---|---|
    | `model-*.json` | 导入 APP 的模型(未达标时文件名带 `-NOT-PASSED`) |
@@ -31,15 +46,16 @@
    | `feature_importance.csv` | 特征重要性 |
    | `train.log` / `data_warnings.txt` | 日志与数据问题 |
 
-其他命令(`realu.bat <命令>`):
+其他命令:
 
 ```bat
-realu.bat backtest out\train-xxx\model-xxx.json 20230101 20241231   :: 用指定区间回测已有模型
-realu.bat predict  out\train-xxx\model-xxx.json 20241008            :: 列出某日信号(不写日期=最新一天)
-realu.bat demo demo-data                                             :: 生成模拟数据(含 hq_cache),验证环境(结果无投资意义)
+realu.exe backtest config.properties out\train-xxx\model-xxx.json 20230101 20241231   :: 用指定区间回测已有模型
+realu.exe predict  config.properties out\train-xxx\model-xxx.json 20241008            :: 列出某日信号(不写日期=最新一天)
+realu.exe demo demo-data                                                              :: 生成模拟数据(含 hq_cache),验证环境(结果无投资意义)
 ```
 
-内存:默认使用物理内存的 65%,可在运行前 `set REALU_HEAP=-Xmx8g` 指定。全市场 2010 年至今约需 3–6GB。
+内存:`realu.exe` 默认最多使用物理内存的 65%。全市场 2010 年至今约需 3–6GB。
+没有 JDK 的电脑也可以用 `gradlew.bat :trainer:winDist` 生成的 zip(`realu.bat` + jar,需要目标电脑安装 Java 17+)。
 
 退出码:0 达标;10 已导出但未达标;2 配置/数据错误;3 内存不足;1 其他异常。
 
