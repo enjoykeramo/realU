@@ -124,10 +124,19 @@ class BarSeries(
 
     /** 当日是否涨停(收盘)。前复权价格存在小数误差,留 0.3% 容差。 */
     fun isLimitUp(i: Int): Boolean =
-        i > 0 && close[i] / close[i - 1] - 1.0 >= limitPct(i) - 0.003
+        i >= IPO_FREE_BARS && close[i] / close[i - 1] - 1.0 >= limitPct(i) - 0.003
 
     fun isLimitDown(i: Int): Boolean =
-        i > 0 && close[i] / close[i - 1] - 1.0 <= -limitPct(i) + 0.003
+        i >= IPO_FREE_BARS && close[i] / close[i - 1] - 1.0 <= -limitPct(i) + 0.003
+
+    /** 盘中曾触及涨停但收盘未封住(炸板)。 */
+    fun isBrokenLimitUp(i: Int): Boolean =
+        i >= IPO_FREE_BARS && high[i] / close[i - 1] - 1.0 >= limitPct(i) - 0.003 && !isLimitUp(i)
+
+    companion object {
+        /** 新股上市前 5 个交易日不设涨跌幅(注册制),这几天的大涨不算涨停。 */
+        const val IPO_FREE_BARS = 5
+    }
 
     /** 一字涨停:开高低收相同且涨停,散户基本买不到。 */
     fun isOneWordLimitUp(i: Int): Boolean =
@@ -146,8 +155,19 @@ object Dates {
         return y in 1990..2100 && m in 1..12 && day in 1..31
     }
 
-    fun toEpochDay(d: Int): Long =
-        java.time.LocalDate.of(d / 10000, d / 100 % 100, d % 100).toEpochDay()
+    /** yyyyMMdd → 自 1970-01-01 的天数(纯整数运算,不分配对象;逐根 K 线调用也很快)。 */
+    fun toEpochDay(d: Int): Long {
+        var y = (d / 10000).toLong()
+        val m = d / 100 % 100
+        val day = d % 100
+        if (m <= 2) y -= 1
+        val era = Math.floorDiv(y, 400L)
+        val yoe = y - era * 400
+        val mp = (m + 9) % 12
+        val doy = (153 * mp + 2) / 5 + day - 1
+        val doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
+        return era * 146097 + doe - 719468
+    }
 
     fun daysBetween(a: Int, b: Int): Long = toEpochDay(b) - toEpochDay(a)
 

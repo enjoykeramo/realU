@@ -40,6 +40,17 @@ class Config(private val props: Properties, val file: File?) {
     val namesCsv: String? get() = strOrNull("data.namesCsv")
     val floatSharesCsv: String? get() = strOrNull("data.floatSharesCsv")
     val bigOrderCsv: String? get() = strOrNull("data.bigOrderCsv")
+    /** 通达信安装目录(含 T0002/hq_cache);留空时自动取 vipdoc 的上一级目录。 */
+    val tdxRoot: String? get() = strOrNull("data.tdxRoot")
+
+    // ---- 板块 ----
+    /** auto:有 hq_cache/tdxhy.cfg 用通达信行业,否则用收益相关性聚类;industry / cluster / none。 */
+    val sectorSource: String get() = str("sector.source", "auto").lowercase()
+    val sectorClusters: Int get() = int("sector.clusters", 40)
+    /** 通达信行业层级:1 = 一级行业,2 = 二级行业,3 = 三级行业。 */
+    val industryLevel: Int get() = int("sector.industryLevel", 2)
+    /** 使用概念板块(hq_cache/block_gn.dat)。注意:概念成分是"现在"的名单,用于历史回测有未来函数。 */
+    val useConcepts: Boolean get() = bool("sector.useConcepts", true)
 
     // ---- 时间切分 ----
     val trainEnd: Int get() = int("split.trainEnd", 20191231)
@@ -48,7 +59,12 @@ class Config(private val props: Properties, val file: File?) {
 
     // ---- 标签/候选/卖出 ----
     val label: LabelParams
-        get() = LabelParams(int("label.horizon", 40), dbl("label.target", 0.30), dbl("label.stop", 0.08))
+        get() = LabelParams(
+            horizon = int("label.horizon", 60),
+            target = dbl("label.target", 0.30),
+            maxDrawdown = dbl("label.maxDrawdown", 0.15),
+            cost = costPerTrade,
+        )
 
     val gate: GateParams
         get() = GateParams(
@@ -63,20 +79,23 @@ class Config(private val props: Properties, val file: File?) {
         )
 
     val exit: ExitRule
-        get() = ExitRule(
-            stopLoss = dbl("exit.stopLoss", 0.08),
-            takeProfit = dbl("exit.takeProfit", 0.0),
-            trailingActivate = dbl("exit.trailingActivate", 0.15),
-            trailingDrawdown = dbl("exit.trailingDrawdown", 0.10),
-            maxHoldDays = int("exit.maxHoldDays", 60),
-        )
+        get() = label.let { lb ->
+            ExitRule(
+                stopLoss = dbl("exit.stopLoss", lb.maxDrawdown),
+                takeProfit = dbl("exit.takeProfit", lb.target + lb.cost),
+                trailingActivate = dbl("exit.trailingActivate", 0.0),
+                trailingDrawdown = dbl("exit.trailingDrawdown", 0.0),
+                profitFloor = dbl("exit.profitFloor", 0.0),
+                maxHoldDays = int("exit.maxHoldDays", lb.horizon),
+            )
+        }
 
     /** 是否在验证集上网格搜索最优卖出参数(只在验证集选,测试集只用来检验)。 */
     val exitGrid: Boolean get() = bool("exit.gridSearch", true)
 
     // ---- 采样与内存 ----
     val negativeKeep: Double get() = dbl("sample.negativeKeep", 1.0)
-    val maxRows: Int get() = int("sample.maxRows", 8_000_000)
+    val maxRows: Int get() = int("sample.maxRows", 6_000_000)
     val memoryLimit: Double get() = dbl("memory.maxUsage", 0.80)
     val threads: Int get() = int("threads", 0).let { if (it <= 0) Runtime.getRuntime().availableProcessors() else it }
     val seed: Long get() = int("seed", 20240601).toLong()

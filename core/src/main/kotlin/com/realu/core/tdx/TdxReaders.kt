@@ -161,7 +161,8 @@ object TdxTxtReader {
 object ExRightsAdjuster {
     fun forwardAdjust(s: BarSeries): Int {
         var events = 0
-        for (i in s.size - 1 downTo 1) {
+        // 前 5 个交易日为新股无涨跌幅期,大幅低开是正常走势,不当作除权
+        for (i in s.size - 1 downTo BarSeries.IPO_FREE_BARS) {
             val limit = s.limitPct(i)
             val gap = s.open[i] / s.close[i - 1] - 1.0
             // 停牌超过 1 年后复牌、新股等极端情况也可能出现大缺口,只处理向下缺口

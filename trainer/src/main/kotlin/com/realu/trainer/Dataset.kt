@@ -3,10 +3,11 @@ package com.realu.trainer
 import com.realu.core.feature.FeatureDefs
 import com.realu.core.feature.FeatureEngine
 import com.realu.core.feature.IndexContext
+import com.realu.core.market.MarketContext
 import com.realu.core.strategy.Labeler
 import com.realu.core.strategy.PatternTagger
 import java.util.Random
-import java.util.concurrent.ExecutorCompletionService
+import java.util.concurrent.Future
 import java.util.concurrent.Executors
 import kotlin.math.min
 
@@ -110,6 +111,7 @@ class DatasetBuilder(
     private val source: DataSource,
     private val stocks: List<StockFile>,
     private val index: IndexContext?,
+    private val market: MarketContext?,
 ) {
     private val nf = FeatureDefs.COUNT
     private val gate = cfg.gate
@@ -119,23 +121,22 @@ class DatasetBuilder(
     fun fitBinner(): Binner {
         val rnd = Random(cfg.seed)
         val pick = stocks.shuffled(rnd).take(min(stocks.size, 400))
-        val reservoir = ArrayList<FloatArray>()
-        val cap = 300_000
-        var seen = 0L
-        for (sf in pick) {
-            val s = source.load(sf).series ?: continue
-            val f = FeatureEngine.compute(s, index, source.extrasFor(sf.code))
+        val perStock = 2000
+        val bySymbol = java.util.concurrent.ConcurrentHashMap<String, List<FloatArray>>()
+        // 并行计算抽样股票的特征;每只股票最多取 perStock 个候选样本,保证各股票权重相近
+        MarketPrep.parallelLoad(source, pick, cfg.threads) { s ->
+            val f = FeatureEngine.compute(s, index, source.extrasFor(s.code), market)
+            val mine = ArrayList<FloatArray>()
             for (i in 0 until s.size) {
                 if (s.date[i] < cfg.startDate || s.date[i] > cfg.trainEnd) continue
-                if (!gate.passes(s, f, i)) continue
-                seen++
-                if (reservoir.size < cap) reservoir += f.row(i)
-                else {
-                    val j = (rnd.nextDouble() * seen).toLong()
-                    if (j < cap) reservoir[j.toInt()] = f.row(i)
-                }
+                if (gate.passes(s, f, i)) mine += f.row(i)
             }
+            val local = Random(cfg.seed + s.code.symbol.hashCode())
+            bySymbol[s.code.symbol] = if (mine.size > perStock) mine.shuffled(local).take(perStock) else mine
         }
+        // 按代码排序后合并:多线程完成顺序不同,也保证每次训练结果可复现
+        val rows = bySymbol.toSortedMap().values.flatten()
+        val reservoir = if (rows.size > 300_000) rows.shuffled(rnd).take(300_000) else rows.toList()
         require(reservoir.size >= 1000) {
             "训练期内候选样本太少(${reservoir.size}),请检查数据目录、split.trainEnd、data.startDate 或放宽 gate.* 条件"
         }
@@ -171,7 +172,8 @@ class DatasetBuilder(
         var stop = false
 
         val pool = Executors.newFixedThreadPool(cfg.threads)
-        val ecs = ExecutorCompletionService<Chunk>(pool)
+        // 按提交顺序取结果(滑动窗口并行):样本顺序固定,训练结果可复现
+        val queue = java.util.ArrayDeque<Future<Chunk>>()
         val inFlight = cfg.threads * 3
         var submitted = 0
         var done = 0
@@ -179,11 +181,11 @@ class DatasetBuilder(
             fun submitNext() {
                 val idx = submitted++
                 val keep = negKeep
-                ecs.submit { processStock(idx, binner, keep) }
+                queue.addLast(pool.submit<Chunk> { processStock(idx, binner, keep) })
             }
             while (submitted < stocks.size && submitted < inFlight) submitNext()
             while (done < submitted) {
-                val ch = ecs.take().get()
+                val ch = queue.removeFirst().get()
                 done++
                 if (!stop && submitted < stocks.size) submitNext()
                 if (ch.failed) {
@@ -267,7 +269,7 @@ class DatasetBuilder(
             return Chunk(idx, ByteArray(0), ByteArray(0), IntArray(0), IntArray(0), ByteArray(0), FloatArray(0), IntArray(0), 0, 0, 0, 0, res.warnings, false)
         }
         return try {
-            val f = FeatureEngine.compute(s, index, source.extrasFor(sf.code))
+            val f = FeatureEngine.compute(s, index, source.extrasFor(sf.code), market)
             val rnd = Random(cfg.seed * 31 + sf.code.symbol.hashCode())
             val rows = GrowBytes(); val lab = GrowBytes(); val pat = GrowBytes()
             val dt = GrowInts(); val ed = GrowInts(); val mg = GrowFloats(); val br = GrowInts()

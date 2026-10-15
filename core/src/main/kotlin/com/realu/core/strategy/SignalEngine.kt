@@ -6,6 +6,8 @@ import com.realu.core.feature.FeatureEngine
 import com.realu.core.feature.FeatureFrame
 import com.realu.core.feature.IndexContext
 import com.realu.core.feature.StockExtras
+import com.realu.core.market.MarketContext
+import com.realu.core.market.TradingCalendar
 import com.realu.core.model.RealuModel
 
 /** 某个特征对评分的影响,用于 APP 结果页的 ✓/× 和理由展示。 */
@@ -33,7 +35,9 @@ class Signal(
  * ```
  * val model = RealuModel.fromJson(jsonText).also { it.checkCompatible() }
  * val engine = SignalEngine(model)
- * val sig = engine.evaluate(series, indexContext)   // 默认评估最后一个交易日
+ * // 先用全市场股票构建一次截面数据(市场情绪、板块、概念强度),每个交易日一次
+ * val market = engine.buildMarket(TradingCalendar(indexSeries.date), allSeries.asSequence())
+ * val sig = engine.evaluate(series, indexContext, market = market)   // 默认评估最后一个交易日
  * if (sig?.triggered == true) ...
  * ```
  * series 需要尽量完整(≥ [FeatureEngine.MIN_HISTORY_BARS] 根),否则均线/MACD 等与训练口径不一致。
@@ -51,9 +55,10 @@ class SignalEngine(val model: RealuModel) {
         extras: StockExtras? = null,
         at: Int = series.size - 1,
         frame: FeatureFrame? = null,
+        market: MarketContext? = null,
     ): Signal? {
         if (at < 0 || at >= series.size) return null
-        val f = frame ?: FeatureEngine.compute(series, index, extras)
+        val f = frame ?: FeatureEngine.compute(series, index, extras, market)
         if (!model.gate.passes(series, f, at)) return null
         val x = f.row(at)
         val p = model.gbdt.probability(x)
@@ -78,15 +83,19 @@ class SignalEngine(val model: RealuModel) {
             triggered = p >= model.threshold,
             pattern = PatternTagger.tag(f, at),
             reasons = reasons,
-            stopPrice = c * (1 - ex.stopLoss),
+            stopPrice = if (ex.stopLoss > 0) c * (1 - ex.stopLoss) else 0.0,
             takeProfitPrice = if (ex.takeProfit > 0) c * (1 + ex.takeProfit) else null,
             trailingText = ex.describe(),
         )
     }
 
+    /** 用模型自带的板块/概念归属,从全市场日K构建截面数据。 */
+    fun buildMarket(calendar: TradingCalendar, all: Sequence<BarSeries>): MarketContext =
+        MarketContext.fromSeries(calendar, all, model.sectors)
+
     /** 批量扫描(例如全市场每日收盘后),按评分降序返回触发的信号。 */
-    fun scan(all: Sequence<BarSeries>, index: IndexContext?, extras: (BarSeries) -> StockExtras? = { null }): List<Signal> =
-        all.mapNotNull { s -> runCatching { evaluate(s, index, extras(s)) }.getOrNull() }
+    fun scan(all: Sequence<BarSeries>, index: IndexContext?, market: MarketContext?, extras: (BarSeries) -> StockExtras? = { null }): List<Signal> =
+        all.mapNotNull { s -> runCatching { evaluate(s, index, extras(s), market = market) }.getOrNull() }
             .filter { it.triggered }
             .sortedByDescending { it.probability }
             .toList()

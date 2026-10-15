@@ -79,6 +79,16 @@ class DataSource(private val cfg: Config) {
         return ParseResult(s, warnings)
     }
 
+    /** 通达信 T0002/hq_cache 目录(行业、概念板块文件所在);vipdoc 通常就在通达信安装目录下。 */
+    fun hqCacheDir(): File? {
+        val roots = listOfNotNull(
+            cfg.tdxRoot?.let { File(it) },
+            cfg.vipdoc?.let { File(it).absoluteFile.parentFile },
+            cfg.txtDir?.let { File(it).absoluteFile.parentFile?.parentFile },
+        )
+        return roots.map { File(it, "T0002/hq_cache") }.firstOrNull { it.isDirectory }
+    }
+
     fun extrasFor(code: StockCode): StockExtras? {
         val fs = floatShares[code.symbol]
         val bo = bigOrder[code.symbol]

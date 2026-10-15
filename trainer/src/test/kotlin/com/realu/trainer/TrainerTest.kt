@@ -5,6 +5,7 @@ import com.realu.core.model.RealuModel
 import com.realu.core.strategy.ExitRule
 import com.realu.core.strategy.GateParams
 import com.realu.core.strategy.LabelParams
+import java.io.File
 import java.util.Random
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -56,17 +57,57 @@ class TrainerTest {
         assertTrue(Metrics.wilsonLower(950, 1000) > 0.93)
     }
 
+    private fun cand(stock: Int, bar: Int, prob: Double, ret: Float, date: Int = 20200101 + bar) = Candidate(
+        stock, "s$stock", "", date, bar, prob, com.realu.core.strategy.Pattern.OTHER, true, 10f,
+        floatArrayOf(ret), shortArrayOf(5), byteArrayOf(com.realu.core.strategy.ExitReason.TAKE_PROFIT.ordinal.toByte()),
+        IntArray(10) { date + 1 + it }, FloatArray(10) { 10f })
+
     @Test
-    fun dedupThresholdCountsOnePerLaunch() {
-        // 同一只股票连续 5 天高分(同一波启动),标签全为 1;另一只股票 1 天高分,标签 0
-        val scores = doubleArrayOf(0.9, 0.9, 0.9, 0.9, 0.9, 0.95)
-        val labels = intArrayOf(1, 1, 1, 1, 1, 0)
-        val stock = intArrayOf(0, 0, 0, 0, 0, 1)
-        val bar = intArrayOf(100, 101, 102, 103, 104, 50)
-        val c = Metrics.chooseThresholdDedup(scores, labels, stock, bar, 20, 0.95, 1)
-        // 去重后最多 2 个信号:不去重会算成 5/6=83%,去重后是 1/2=50%
-        assertTrue(c.signals <= 2)
-        assertEquals(0.9, c.threshold)
+    fun selectorCountsOneSignalPerLaunch() {
+        // 同一只股票连续 5 天高分(同一波启动)且都成功;另一只分数略低且失败
+        val cands = (0 until 5).map { cand(0, 100 + it, 0.9, 0.35f) } + cand(1, 50, 0.85, -0.1f)
+        val sorted = cands.sortedWith(compareBy<Candidate> { it.date }.thenByDescending { it.prob })
+        val sel = Selector.dedupe(sorted, 0.85, 20)
+        assertEquals(2, sel.size) // 不去重会算成 5/6,去重后 1/2
+        val lp = com.realu.core.strategy.LabelParams()
+        val st = TradeStats(sel, 0, lp)
+        assertEquals(0.5, st.precision)
+        val choice = Selector.select(sorted, listOf(com.realu.core.strategy.ExitRule()), lp, 0.95, 1, 20, "precision", 99991231)
+        assertTrue(choice.achieved)
+        assertEquals(0.9, choice.threshold) // 阈值 0.9 排除失败的那只:1/1 达标;0.85 时只有 1/2
+    }
+
+    @Test
+    fun tdxBlockFilesRoundTrip() {
+        val dir = kotlin.io.path.createTempDirectory("realu").toFile()
+        try {
+            SyntheticData.writeTdx(dir, stocks = 24, days = 300, seed = 1, sectors = 4)
+            val hq = File(dir, "T0002/hq_cache")
+            val ind = TdxSectorFiles.readIndustry(File(hq, "tdxhy.cfg"), 2)
+            assertEquals(24, ind.size)
+            assertEquals(4, ind.values.distinct().size)
+            val blocks = TdxSectorFiles.readBlocks(File(hq, "block_gn.dat"))
+            assertEquals(5, blocks.size)
+            assertEquals("概念00", blocks[0].first)
+            assertEquals(6, blocks[0].second.size)
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun kmeansSeparatesCorrelatedGroups() {
+        val rnd = Random(2)
+        val f = Array(3) { FloatArray(250) { rnd.nextGaussian().toFloat() } }
+        val x = (0 until 60).map { i ->
+            val v = FloatArray(250) { t -> f[i % 3][t] + 0.3f * rnd.nextGaussian().toFloat() }
+            val m = v.average().toFloat(); for (t in v.indices) v[t] -= m
+            val norm = kotlin.math.sqrt(v.sumOf { (it * it).toDouble() }).toFloat(); for (t in v.indices) v[t] /= norm
+            v
+        }
+        val a = SectorClustering.kmeans(x, 3, Random(1))
+        for (i in 0 until 60) assertEquals(a[i % 3], a[i], "同一因子的股票应在同一组")
+        assertEquals(3, a.toSet().size)
     }
 
     @Test

@@ -4,9 +4,13 @@ import com.realu.core.data.BarSeries
 import com.realu.core.data.Board
 import com.realu.core.data.Dates
 import com.realu.core.data.StockCode
+import com.realu.core.feature.ChipDistribution
 import com.realu.core.feature.FeatureDefs
 import com.realu.core.feature.FeatureEngine
 import com.realu.core.indicator.Ind
+import com.realu.core.market.MarketContext
+import com.realu.core.market.SectorMap
+import com.realu.core.market.TradingCalendar
 import com.realu.core.model.GbdtModel
 import com.realu.core.model.Tree
 import com.realu.core.strategy.ExitReason
@@ -92,12 +96,13 @@ class CoreTest {
     @Test
     fun exRightsHeuristic() {
         // 第 3 天 10 送 10:开盘价腰斩
-        val close = doubleArrayOf(20.0, 20.4, 10.3, 10.5)
-        val open = doubleArrayOf(20.0, 20.0, 10.2, 10.3)
+        // 前面补 6 根:新股前 5 日无涨跌幅,不做除权识别
+        val close = DoubleArray(6) { 20.0 } + doubleArrayOf(20.4, 10.3, 10.5)
+        val open = DoubleArray(6) { 20.0 } + doubleArrayOf(20.0, 10.2, 10.3)
         val s = series(close, open)
         assertEquals(1, ExRightsAdjuster.forwardAdjust(s))
-        assertEquals(20.4 * 10.2 / 20.4, s.close[1], 1e-9)
-        assertTrue(abs(s.close[1] - s.open[2]) < 1e-9)
+        assertEquals(20.4 * 10.2 / 20.4, s.close[6], 1e-9)
+        assertTrue(abs(s.close[6] - s.open[7]) < 1e-9)
     }
 
     @Test
@@ -112,20 +117,42 @@ class CoreTest {
     }
 
     @Test
-    fun labelAndTradeRespectTPlusOneAndStop() {
-        // 信号日 0,买入日 1 开盘 10 元;买入日当天最低 8.5 不能止损(T+1);次日跌破 9.2 止损
-        val close = doubleArrayOf(10.0, 9.0, 9.0, 9.5)
-        val open = doubleArrayOf(10.0, 10.0, 9.5, 9.0)
-        val low = doubleArrayOf(10.0, 8.5, 9.3, 9.0)
-        val high = doubleArrayOf(10.0, 10.0, 9.5, 9.6)
+    fun closeBasedStopRespectsTPlusOne() {
+        // 信号日 0,买入日 1 开盘 10 元;买入日收盘 8.0 已破 −15% 线但 T+1 不能卖;次日收盘 8.4 仍在线下 → 止损
+        val close = doubleArrayOf(10.0, 9.6, 9.2, 8.4, 9.0)
+        val open = doubleArrayOf(10.0, 10.0, 9.6, 9.2, 8.4)
+        val low = doubleArrayOf(9.9, 8.0, 7.9, 8.3, 8.4) // 盘中跌破不触发,只看收盘
+        val high = doubleArrayOf(10.1, 10.1, 9.7, 9.3, 9.1)
         val s = series(close, open, high, low)
-        val t = assertNotNull(TradeSimulator.simulate(s, 0, ExitRule(stopLoss = 0.08, maxHoldDays = 10)))
+        val t = assertNotNull(TradeSimulator.simulate(s, 0, ExitRule(stopLoss = 0.15, takeProfit = 0.30, maxHoldDays = 10)))
         assertEquals(ExitReason.STOP_LOSS, t.reason)
         assertEquals(3, t.exitIndex)
-        assertEquals(9.0, t.exitPrice, 1e-9) // 跳空低开到 9.0,以开盘价成交
-        val rising = DoubleArray(45) { 10.0 * Math.pow(1.02, it.toDouble()) }
-        val lr = Labeler.label(series(rising, DoubleArray(45) { rising[it] * 0.99 }), 0, LabelParams(horizon = 40, target = 0.30, stop = 0.08))
-        assertEquals(LabelOutcome.HIT, lr.outcome)
+        assertEquals(8.4, t.exitPrice, 1e-9)
+    }
+
+    private fun path(vararg closes: Double): BarSeries {
+        val c = closes
+        return series(c, DoubleArray(c.size) { if (it == 0) c[0] else c[it - 1] }, DoubleArray(c.size) { c[it] * 1.01 }, DoubleArray(c.size) { c[it] * 0.99 })
+    }
+
+    @Test
+    fun targetAllowsDrawdownThenThirtyPercent() {
+        val lp = LabelParams(horizon = 60, target = 0.30, maxDrawdown = 0.15, cost = 0.003)
+        // 买入 10(次日开盘 = 前收 10),先回撤到 8.8(−12%,在容忍范围内),再涨到 13.1(+31%)→ 成功
+        val up = mutableListOf(10.0, 10.0, 9.5, 9.0, 8.8)
+        while (up.last() < 13.1) up += up.last() * 1.05
+        val hit = Labeler.label(path(*up.toDoubleArray()), 0, lp)
+        assertEquals(LabelOutcome.HIT, hit.outcome)
+        // 回撤到 8.4(−16%)→ 失败,即使之后涨上去
+        val down = mutableListOf(10.0, 10.0, 9.5, 9.0, 8.4)
+        while (down.last() < 14.0) down += down.last() * 1.05
+        assertEquals(LabelOutcome.STOPPED, Labeler.label(path(*down.toDoubleArray()), 0, lp).outcome)
+        // 不设回撤上限时同一路径成功
+        assertEquals(LabelOutcome.HIT, Labeler.label(path(*down.toDoubleArray()), 0, lp.copy(maxDrawdown = 0.0)).outcome)
+        // 60 日内没涨到 30% → 失败;数据不足 60 日且未达标 → 未完成,不作为样本
+        val flat = DoubleArray(80) { 10.0 + (it % 3) * 0.1 }
+        assertEquals(LabelOutcome.EXPIRED, Labeler.label(path(*flat), 0, lp).outcome)
+        assertEquals(LabelOutcome.NO_DATA, Labeler.label(path(*flat.copyOf(30)), 0, lp).outcome)
     }
 
     @Test
@@ -133,20 +160,59 @@ class CoreTest {
         val n = 12
         val close = DoubleArray(n) { if (it <= 6) 10.0 * (1 + 0.05 * it) else 13.0 - (it - 6) * 0.5 }
         val s = series(close, close.copyOf())
-        val t = assertNotNull(TradeSimulator.simulate(s, 0, ExitRule(stopLoss = 0.08, trailingActivate = 0.15, trailingDrawdown = 0.10, maxHoldDays = 30)))
+        val t = assertNotNull(TradeSimulator.simulate(s, 0, ExitRule(stopLoss = 0.08, takeProfit = 0.0, trailingActivate = 0.15, trailingDrawdown = 0.10, maxHoldDays = 30)))
         assertEquals(ExitReason.TRAILING, t.reason)
-        // 买入 10.5,最高 13.0,回撤 10% 线 11.7;第 9 天收在 11.5 触发,按 11.5 成交
+        // 买入 10.5,最高收盘 13.0,回撤 10% 线 11.7;第 9 天收在 11.5 触发,按收盘 11.5 成交
         assertEquals(9, t.exitIndex)
         assertEquals(11.5 / 10.5 - 1, t.ret, 1e-9)
     }
 
     @Test
+    fun chipDistributionBehaves() {
+        val n = 400
+        val c = DoubleArray(n) { if (it < 300) 10.0 + (it % 5) * 0.05 else 10.0 * Math.pow(1.01, (it - 300).toDouble()) }
+        val s = series(c, c.copyOf(), DoubleArray(n) { c[it] * 1.01 }, DoubleArray(n) { c[it] * 0.99 })
+        val ch = ChipDistribution.compute(s, null)
+        val winner = ch[0]
+        assertTrue(winner[299] in 0f..1f)
+        assertTrue(winner[399] > 0.9f, "持续上涨后获利盘应接近 100%:${winner[399]}")
+        assertTrue(ch[2][299] < 0.05f, "横盘后筹码应高度集中:${ch[2][299]}")
+        assertTrue(ch[2][399] > ch[2][299], "上涨后筹码发散")
+    }
+
+    @Test
+    fun marketSentimentAndSectorStats() {
+        val cal = TradingCalendar(IntArray(40) { Dates.plusDays(20200101, it.toLong()) })
+        fun mk(code: String, luDays: Set<Int>): BarSeries {
+            val c = DoubleArray(40); var p = 10.0
+            for (i in 0 until 40) { p *= if (i in luDays) 1.10 else 1.001; c[i] = Math.round(p * 100) / 100.0 }
+            return series(c, c.copyOf(), DoubleArray(40) { c[it] * 1.0 }, DoubleArray(40) { c[it] * 0.98 }, StockCode("sh", code))
+        }
+        val a = mk("600001", setOf(30, 31)); val b = mk("600002", setOf(31)); val d = mk("600003", emptySet())
+        val sectors = SectorMap.static("industry", mapOf("sh600001" to 0, "sh600002" to 0, "sh600003" to 0), emptyList(), emptyMap())
+        val ctx = MarketContext.fromSeries(cal, sequenceOf(a, b, d), sectors)
+        val m = ctx.marketAt(cal.dates[31])
+        assertEquals(200f / 3, m.getValue("mktLimitUpPct"), 1e-3f)   // 3 只中 2 只涨停
+        assertEquals(2f, m.getValue("mktMaxStreak"))                   // 600001 两连板
+        assertEquals(1f, m.getValue("mktPromote"))                     // 昨日 1 只涨停,今日晋级
+        val v = ctx.view(a)
+        assertEquals(2f, v.getValue("secLimitUps")[31])
+        assertEquals(1f, v.getValue("stkSecRank20")[35])              // 600001 板块内涨幅第一
+        // 截面数据只用当日及以前:截断后重算,第 31 天的值不变
+        val cut = MarketContext.fromSeries(TradingCalendar(cal.dates.copyOf(32)), sequenceOf(a.slice(0, 32), b.slice(0, 32), d.slice(0, 32)), sectors)
+        assertEquals(m, cut.marketAt(cal.dates[31]))
+    }
+
+    @Test
     fun oneWordLimitUpIsNotBuyable() {
-        val close = doubleArrayOf(10.0, 11.0, 11.5)
-        val open = doubleArrayOf(10.0, 11.0, 11.0)
-        val s = series(close, open, doubleArrayOf(10.0, 11.0, 11.6), doubleArrayOf(10.0, 11.0, 11.0))
-        assertTrue(s.isOneWordLimitUp(1))
-        assertNull(TradeSimulator.simulate(s, 0, ExitRule()))
+        val pre = DoubleArray(6) { 10.0 }
+        val close = pre + doubleArrayOf(11.0, 11.5)
+        val open = pre + doubleArrayOf(11.0, 11.0)
+        val s = series(close, open, pre + doubleArrayOf(11.0, 11.6), pre + doubleArrayOf(11.0, 11.0))
+        assertTrue(s.isOneWordLimitUp(6))
+        assertNull(TradeSimulator.simulate(s, 5, ExitRule()))
+        // 新股上市前 5 日的大涨不算涨停
+        assertFalse(series(doubleArrayOf(10.0, 14.4), doubleArrayOf(10.0, 14.4)).isLimitUp(1))
     }
 
     @Test

@@ -33,7 +33,8 @@ object SyntheticData {
 
     class Bars(val open: DoubleArray, val high: DoubleArray, val low: DoubleArray, val close: DoubleArray, val vol: DoubleArray)
 
-    fun generate(days: Int, rnd: Random, limit: Double = 0.10): Bars {
+    /** factor:所属板块的每日共同收益(模拟板块联动),可为 null。 */
+    fun generate(days: Int, rnd: Random, limit: Double = 0.10, factor: DoubleArray? = null): Bars {
         val o = DoubleArray(days); val h = DoubleArray(days); val l = DoubleArray(days); val c = DoubleArray(days); val v = DoubleArray(days)
         var price = 5.0 + rnd.nextDouble() * 30
         val baseVol = 2e6 + rnd.nextDouble() * 2e7
@@ -41,10 +42,12 @@ object SyntheticData {
         var regimeDrift = 0.0
         while (i < days) {
             // 事件:箱体 40 日 → 启动 → 主升 20 日(65%)/ 假突破回落(35%)
-            if (i > 200 && i < days - 100 && rnd.nextDouble() < 0.006) {
+            // 板块近期走强时更容易出现启动事件(模拟板块轮动)
+            val hot = factor != null && i >= 5 && (i - 5 until i).sumOf { factor[it] } > 0.02
+            if (i > 200 && i < days - 100 && rnd.nextDouble() < (if (hot) 0.012 else 0.005)) {
                 val boxTop = price * 1.06
                 val boxBot = price * 0.94
-                val genuine = rnd.nextDouble() < 0.65
+                val genuine = rnd.nextDouble() < (if (hot) 0.75 else 0.55)
                 for (k in 0 until 40) {
                     if (i >= days) break
                     val prev = price
@@ -68,7 +71,7 @@ object SyntheticData {
             }
             if (rnd.nextDouble() < 0.01) regimeDrift = rnd.nextGaussian() * 0.002
             val prev = price
-            price *= 1 + regimeDrift + rnd.nextGaussian() * 0.022
+            price *= 1 + regimeDrift + (factor?.get(i) ?: 0.0) + rnd.nextGaussian() * 0.018
             price = max(price, 1.0)
             bar(o, h, l, c, v, i, prev, price, baseVol * exp(rnd.nextGaussian() * 0.35), rnd, limit)
             i++
@@ -104,20 +107,53 @@ object SyntheticData {
         file.writeBytes(buf.array())
     }
 
-    /** 返回写出的文件数。 */
-    fun writeVipdoc(root: File, stocks: Int, days: Int, seed: Long): Int {
+    /**
+     * 写出模拟的通达信目录:root/vipdoc/{sh,sz}/lday 下的 .day 文件;withHqCache 时再写 root/T0002/hq_cache 下的
+     * tdxhy.cfg(行业)与 block_gn.dat(概念),用于验证行业/概念板块读取。返回 .day 文件数。
+     */
+    fun writeTdx(root: File, stocks: Int, days: Int, seed: Long, sectors: Int = 12, withHqCache: Boolean = true): Int {
         val rnd = Random(seed)
         val dates = tradingDays(LocalDate.of(2012, 1, 4), days)
+        val vipdoc = File(root, "vipdoc")
         var count = 0
-        // 指数
         val idx = generate(days, Random(seed + 1), limit = 0.10)
-        writeDay(File(root, "sh/lday/sh000001.day"), dates, idx); count++
+        writeDay(File(vipdoc, "sh/lday/sh000001.day"), dates, idx); count++
+        // 板块共同因子:带持续性的随机游走(强弱轮动)
+        val factors = Array(sectors) {
+            val f = DoubleArray(days)
+            var drift = 0.0
+            for (i in 0 until days) { if (rnd.nextDouble() < 0.02) drift = rnd.nextGaussian() * 0.004; f[i] = drift + rnd.nextGaussian() * 0.012 }
+            f
+        }
+        val hy = StringBuilder()
+        val members = Array(sectors) { ArrayList<String>() }
         for (k in 0 until stocks) {
             val (market, code) = if (k % 2 == 0) "sh" to "60%04d".format(k) else "sz" to "00%04d".format(k)
+            val sec = k % sectors
             val listedAt = if (rnd.nextDouble() < 0.2) rnd.nextInt(days / 2) else 0
-            val b = generate(days - listedAt, Random(rnd.nextLong()))
-            writeDay(File(root, "$market/lday/$market$code.day"), dates.copyOfRange(listedAt, days), b)
+            val b = generate(days - listedAt, Random(rnd.nextLong()), factor = factors[sec].copyOfRange(listedAt, days))
+            writeDay(File(vipdoc, "$market/lday/$market$code.day"), dates.copyOfRange(listedAt, days), b)
+            hy.append(if (market == "sh") "1" else "0").append('|').append(code).append('|').append("T%02d%02d".format(1 + sec / 4, 1 + sec % 4)).append("|||\r\n")
+            members[sec] += code
             count++
+        }
+        if (withHqCache) {
+            val hq = File(root, "T0002/hq_cache")
+            hq.mkdirs()
+            File(hq, "tdxhy.cfg").writeBytes(hy.toString().toByteArray(Charsets.US_ASCII))
+            // 概念:每个行业一个同名概念 + 一个跨行业的大概念
+            val blocks = members.mapIndexed { i, m -> "概念%02d".format(i) to m } + ("大盘蓝筹" to members.flatMap { it.take(3) })
+            val buf = ByteBuffer.allocate(386 + blocks.size * 2813).order(ByteOrder.LITTLE_ENDIAN)
+            buf.position(384); buf.putShort(blocks.size.toShort())
+            for ((name, codes) in blocks) {
+                val start = buf.position()
+                val nb = name.toByteArray(charset("GBK")).copyOf(9)
+                buf.put(nb)
+                buf.putShort(codes.size.toShort()); buf.putShort(2)
+                for (c in codes.take(400)) { buf.put(c.toByteArray(Charsets.US_ASCII)); buf.put(0) }
+                buf.position(start + 2813)
+            }
+            File(hq, "block_gn.dat").writeBytes(buf.array())
         }
         return count
     }

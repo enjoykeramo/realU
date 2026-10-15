@@ -1,11 +1,13 @@
 package com.realu.core.model
 
 import com.realu.core.feature.FeatureDefs
+import com.realu.core.market.SectorMap
 import com.realu.core.strategy.ExitRule
 import com.realu.core.strategy.GateParams
 import com.realu.core.strategy.LabelParams
 import com.realu.core.util.Json
 import com.realu.core.util.asDouble
+import com.realu.core.util.asInt
 import com.realu.core.util.asJsonList
 import com.realu.core.util.asJsonMap
 import com.realu.core.util.dbl
@@ -128,6 +130,8 @@ class RealuModel(
     /** 特征组权重(由特征重要性汇总,合计 100),对应 APP"评分因子"。 */
     val factorWeights: Map<String, Int>,
     val dataInfo: Map<String, Any?>,
+    /** 训练时最后一段的板块/概念归属,APP 用它计算板块与概念强度特征。 */
+    val sectors: SectorMap? = null,
 ) {
     /** APP 展示用 0–100 分:阈值映射到 60 分(与原型"入选线 ≥ 60"一致)。 */
     fun score(probability: Double): Int {
@@ -159,12 +163,25 @@ class RealuModel(
                 "maxPriorRise20" to gate.maxPriorRise20, "requireUpClose" to gate.requireUpClose,
                 "excludeSt" to gate.excludeSt, "resumeCooldown" to gate.resumeCooldown,
             ),
-            "label" to linkedMapOf("horizon" to label.horizon, "target" to label.target, "stop" to label.stop),
+            "label" to linkedMapOf(
+                "horizon" to label.horizon, "target" to label.target, "maxDrawdown" to label.maxDrawdown,
+                "cost" to label.cost, "text" to label.describe(),
+            ),
             "exit" to linkedMapOf(
+                "basis" to "close",
                 "stopLoss" to exit.stopLoss, "takeProfit" to exit.takeProfit,
                 "trailingActivate" to exit.trailingActivate, "trailingDrawdown" to exit.trailingDrawdown,
-                "maxHoldDays" to exit.maxHoldDays,
+                "profitFloor" to exit.profitFloor, "maxHoldDays" to exit.maxHoldDays,
             ),
+            "sectors" to sectors?.let { sec ->
+                linkedMapOf(
+                    "source" to sec.source,
+                    "groupNames" to sec.groupNames,
+                    "groups" to sec.groupsTable().toSortedMap(),
+                    "conceptNames" to sec.conceptNames,
+                    "concepts" to sec.conceptsTable().toSortedMap().mapValues { it.value.toList() },
+                )
+            },
             "display" to linkedMapOf(
                 "hardConditions" to gate.describe().map { linkedMapOf("label" to it.first, "value" to it.second) },
                 "scoreFactors" to factorWeights.map { linkedMapOf("name" to it.key, "weight" to it.value) },
@@ -183,12 +200,13 @@ class RealuModel(
 
     companion object {
         const val FORMAT = "realu-model"
-        const val FORMAT_VERSION = 1
+        const val FORMAT_VERSION = 2
 
         fun fromJson(text: String): RealuModel {
             val root = Json.parse(text.removePrefix("﻿")).asJsonMap()
             require(root["format"] == FORMAT) { "不是 realU 模型文件" }
             require(root.int("formatVersion") <= FORMAT_VERSION) { "模型文件版本过新,请升级 APP" }
+            require(root.int("formatVersion") == FORMAT_VERSION) { "旧版模型文件(格式 ${root["formatVersion"]}),请用新版训练器重新训练" }
             val g = root.obj("gate")
             val lb = root.obj("label")
             val ex = root.obj("exit")
@@ -208,14 +226,24 @@ class RealuModel(
                     maxPriorRise20 = g.dbl("maxPriorRise20"), requireUpClose = g["requireUpClose"] as Boolean,
                     excludeSt = g["excludeSt"] as Boolean, resumeCooldown = g.int("resumeCooldown"),
                 ),
-                label = LabelParams(lb.int("horizon"), lb.dbl("target"), lb.dbl("stop")),
-                exit = ExitRule(ex.dbl("stopLoss"), ex.dbl("takeProfit"), ex.dbl("trailingActivate"), ex.dbl("trailingDrawdown"), ex.int("maxHoldDays")),
+                label = LabelParams(lb.int("horizon"), lb.dbl("target"), lb.dbl("maxDrawdown"), lb.dbl("cost")),
+                exit = ExitRule(ex.dbl("stopLoss"), ex.dbl("takeProfit"), ex.dbl("trailingActivate"), ex.dbl("trailingDrawdown"),
+                    ex.dbl("profitFloor"), ex.int("maxHoldDays")),
                 gbdt = GbdtModel(mdl["baseScore"].asDouble(), mdl.list("trees").map { Tree.fromJson(it.asJsonMap()) }),
                 threshold = root.dbl("threshold"),
                 passed = root["passed"] as? Boolean ?: false,
                 metrics = root["metrics"] as? Map<String, Any?> ?: emptyMap(),
                 factorWeights = display.list("scoreFactors").associate { val m = it.asJsonMap(); m.str("name") to m.int("weight") },
                 dataInfo = root["data"] as? Map<String, Any?> ?: emptyMap(),
+                sectors = (root["sectors"] as? Map<String, Any?>)?.let { sec ->
+                    SectorMap.static(
+                        source = sec.str("source"),
+                        groups = sec.obj("groups").mapValues { it.value.asInt() },
+                        conceptNames = sec.list("conceptNames").map { it as String },
+                        concepts = sec.obj("concepts").mapValues { it.value.asJsonList().toIntArray() },
+                        groupNames = (sec["groupNames"] as? List<Any?>)?.map { it as String } ?: emptyList(),
+                    )
+                },
             )
         }
     }

@@ -3,6 +3,7 @@ package com.realu.core.feature
 import com.realu.core.data.BarSeries
 import com.realu.core.data.Dates
 import com.realu.core.indicator.Ind
+import com.realu.core.market.MarketContext
 import kotlin.math.ln
 import kotlin.math.log10
 import kotlin.math.max
@@ -16,6 +17,10 @@ enum class FeatureGroup(val label: String) {
     TURNOVER("换手率"),
     FLOW("资金/大单"),
     MARKET("市场环境"),
+    SENTIMENT("市场情绪"),
+    SECTOR("行业/板块强度"),
+    CONCEPT("概念强度"),
+    CHIPS("筹码分布"),
     META("板块属性"),
 }
 
@@ -26,7 +31,7 @@ class FeatureDef(val name: String, val group: FeatureGroup, val label: String)
  * APP 加载模型时会校验版本与名称,防止训练/推理口径不一致。
  */
 object FeatureDefs {
-    const val VERSION = 1
+    const val VERSION = 2
 
     val ALL: List<FeatureDef> = listOf(
         // K线组合
@@ -46,6 +51,7 @@ object FeatureDefs {
         FeatureDef("limitUps60", FeatureGroup.KLINE, "近60日涨停数"),
         FeatureDef("engulf", FeatureGroup.KLINE, "阳包阴/反包"),
         FeatureDef("bigYang5", FeatureGroup.KLINE, "近5日大阳(>5%)数"),
+        FeatureDef("streak", FeatureGroup.KLINE, "连板数"),
         // 趋势位置
         FeatureDef("pos60", FeatureGroup.TREND, "60日区间位置"),
         FeatureDef("pos250", FeatureGroup.TREND, "250日区间位置"),
@@ -107,6 +113,38 @@ object FeatureDefs {
         FeatureDef("board", FeatureGroup.META, "板块(0主板1创业2科创3北交)"),
         FeatureDef("limitPct", FeatureGroup.META, "涨跌停幅度"),
         FeatureDef("listedLog", FeatureGroup.META, "上市天数(对数)"),
+        // 市场情绪(全市场截面,每日相同)
+        FeatureDef("mktLimitUpPct", FeatureGroup.SENTIMENT, "涨停家数占比%"),
+        FeatureDef("mktLimitDownPct", FeatureGroup.SENTIMENT, "跌停家数占比%"),
+        FeatureDef("mktLimitUp5", FeatureGroup.SENTIMENT, "5日平均涨停占比%"),
+        FeatureDef("mktBrokenRate", FeatureGroup.SENTIMENT, "炸板率"),
+        FeatureDef("mktMaxStreak", FeatureGroup.SENTIMENT, "连板高度"),
+        FeatureDef("mktPromote", FeatureGroup.SENTIMENT, "连板晋级率"),
+        FeatureDef("mktPremium", FeatureGroup.SENTIMENT, "昨日涨停今日溢价"),
+        FeatureDef("mktAdvRatio", FeatureGroup.SENTIMENT, "上涨家数占比"),
+        FeatureDef("mktAboveMa20", FeatureGroup.SENTIMENT, "站上MA20个股占比"),
+        FeatureDef("mktNewHighPct", FeatureGroup.SENTIMENT, "创60日新高占比%"),
+        // 行业/板块强度
+        FeatureDef("secRet5", FeatureGroup.SECTOR, "所属板块5日涨幅"),
+        FeatureDef("secRet20", FeatureGroup.SECTOR, "所属板块20日涨幅"),
+        FeatureDef("secRank5", FeatureGroup.SECTOR, "板块5日强度排名(百分位)"),
+        FeatureDef("secLimitUps", FeatureGroup.SECTOR, "板块今日涨停数"),
+        FeatureDef("secLimitUps5", FeatureGroup.SECTOR, "板块5日涨停数"),
+        FeatureDef("secAboveMa20", FeatureGroup.SECTOR, "板块站上MA20占比"),
+        FeatureDef("stkSecRank20", FeatureGroup.SECTOR, "个股板块内20日涨幅排名(龙头度)"),
+        FeatureDef("rsSec20", FeatureGroup.SECTOR, "个股相对板块20日强度"),
+        // 概念强度
+        FeatureDef("conMaxRet5", FeatureGroup.CONCEPT, "所属概念最大5日涨幅"),
+        FeatureDef("conHotCount", FeatureGroup.CONCEPT, "所属热门概念数(前10%)"),
+        FeatureDef("conMaxLimitUps", FeatureGroup.CONCEPT, "所属概念最多涨停数"),
+        // 筹码分布
+        FeatureDef("chipWinner", FeatureGroup.CHIPS, "获利盘比例"),
+        FeatureDef("chipAvgDev", FeatureGroup.CHIPS, "收盘偏离平均成本"),
+        FeatureDef("chipConc90", FeatureGroup.CHIPS, "90%筹码集中度"),
+        FeatureDef("chipConc70", FeatureGroup.CHIPS, "70%筹码集中度"),
+        FeatureDef("chipOverhead10", FeatureGroup.CHIPS, "上方10%内套牢盘"),
+        FeatureDef("chipSupport10", FeatureGroup.CHIPS, "下方10%内支撑筹码"),
+        FeatureDef("chipWinnerChg5", FeatureGroup.CHIPS, "获利盘5日变化"),
     )
 
     val NAMES: List<String> = ALL.map { it.name }
@@ -185,7 +223,7 @@ object FeatureEngine {
     /** EMA/SMA 类指标需要足够历史才能收敛;APP 端计算时至少传入这么多根 K 线。 */
     const val MIN_HISTORY_BARS = 500
 
-    fun compute(s: BarSeries, index: IndexContext? = null, extras: StockExtras? = null): FeatureFrame {
+    fun compute(s: BarSeries, index: IndexContext? = null, extras: StockExtras? = null, market: MarketContext? = null): FeatureFrame {
         val n = s.size
         val o = s.open; val h = s.high; val l = s.low; val c = s.close; val v = s.volume; val a = s.amount
         val out = Array(FeatureDefs.COUNT) { FloatArray(n) { Float.NaN } }
@@ -249,6 +287,8 @@ object FeatureEngine {
         }
         val bigYang = IntArray(n + 1).also { for (i in 0 until n) it[i + 1] = it[i] + if (r1[i] > 0.05) 1 else 0 }
         put("bigYang5") { (bigYang[it + 1] - bigYang[max(0, it - 4)]).toDouble() }
+        val streak = IntArray(n).also { for (i in 0 until n) it[i] = if (limitUp[i]) (if (i > 0) it[i - 1] else 0) + 1 else 0 }
+        put("streak") { min(streak[it], 15).toDouble() }
 
         put("pos60") { div(c[it] - ll60[it], hh60[it] - ll60[it]) }
         put("pos250") { div(c[it] - ll250[it], hh250[it] - ll250[it]) }
@@ -348,6 +388,20 @@ object FeatureEngine {
         put("limitPct") { s.limitPct(it) }
         // 封顶 750 根:APP 只加载最近若干年数据时,也能得到与训练相同的值
         put("listedLog") { ln(min(it + 1, MAX_LISTED_BARS).toDouble()) }
+
+        // 全市场情绪 / 板块 / 概念(需要 MarketContext;没有时为缺失值)
+        if (market != null) {
+            for ((name, col) in market.view(s)) {
+                val k = FeatureDefs.INDEX[name] ?: continue
+                System.arraycopy(col, 0, out[k], 0, n)
+            }
+            val sec20 = out[FeatureDefs.INDEX.getValue("secRet20")]
+            put("rsSec20") { ret(it, 20) - sec20[it] }
+        }
+
+        // 筹码分布
+        val chips = ChipDistribution.compute(s, turnover)
+        ChipDistribution.NAMES.forEachIndexed { k, name -> System.arraycopy(chips[k], 0, out[FeatureDefs.INDEX.getValue(name)], 0, n) }
 
         return FeatureFrame(s, out)
     }

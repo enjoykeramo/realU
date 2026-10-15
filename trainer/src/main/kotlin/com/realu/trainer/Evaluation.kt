@@ -1,17 +1,16 @@
 package com.realu.trainer
 
+import com.realu.core.data.Dates
 import com.realu.core.feature.FeatureEngine
 import com.realu.core.feature.IndexContext
+import com.realu.core.market.MarketContext
 import com.realu.core.model.GbdtModel
 import com.realu.core.strategy.ExitReason
 import com.realu.core.strategy.ExitRule
 import com.realu.core.strategy.GateParams
-import com.realu.core.strategy.LabelOutcome
 import com.realu.core.strategy.LabelParams
-import com.realu.core.strategy.Labeler
 import com.realu.core.strategy.Pattern
 import com.realu.core.strategy.PatternTagger
-import com.realu.core.strategy.Trade
 import com.realu.core.strategy.TradeSimulator
 import java.util.concurrent.Callable
 import java.util.concurrent.Executors
@@ -47,219 +46,248 @@ object Metrics {
         return (c - r) / d
     }
 
-    class ThresholdChoice(val threshold: Double, val precision: Double, val signals: Int, val hits: Int, val achieved: Boolean)
-
-    /**
-     * 在验证集上选阈值:在"信号数 ≥ minSignals"的前提下,
-     * 找精确率 ≥ target 的最低阈值(信号最多);达不到时取精确率最高的阈值并标记未达标。
-     */
-    fun chooseThreshold(scores: DoubleArray, labels: IntArray, target: Double, minSignals: Int): ThresholdChoice {
-        val order = scores.indices.sortedByDescending { scores[it] }
-        var hits = 0
-        var bestK = -1; var bestPrec = -1.0
-        var okK = -1
-        for (k in order.indices) {
-            hits += labels[order[k]]
-            val n = k + 1
-            // 同分样本必须一起取,阈值只能落在分数变化处
-            if (k + 1 < order.size && scores[order[k + 1]] == scores[order[k]]) continue
-            val prec = hits.toDouble() / n
-            if (n >= minSignals) {
-                if (prec >= target) okK = k
-                if (prec > bestPrec) { bestPrec = prec; bestK = k }
-            }
-        }
-        val k = if (okK >= 0) okK else bestK
-        if (k < 0) return ThresholdChoice(1.0, 0.0, 0, 0, false)
-        val th = scores[order[k]]
-        var h = 0
-        for (i in 0..k) h += labels[order[i]]
-        return ThresholdChoice(th, h.toDouble() / (k + 1), k + 1, h, okK >= 0)
+    fun quantile(x: DoubleArray, q: Double): Double {
+        if (x.isEmpty()) return 0.0
+        val s = x.sortedArray()
+        return s[((s.size - 1) * q).toInt().coerceIn(0, s.size - 1)]
     }
-
-    /**
-     * 与回测口径一致的阈值选择:同一只股票在冷却期(cooldown 个交易日)内只算第一次信号。
-     * 同一波启动往往连续几天都满足条件,不去重会把准确率算高。
-     * 候选阈值取验证集概率的分位点,逐一模拟去重后的信号数与命中数。
-     */
-    fun chooseThresholdDedup(
-        scores: DoubleArray, labels: IntArray, stock: IntArray, bar: IntArray,
-        cooldown: Int, target: Double, minSignals: Int,
-    ): ThresholdChoice {
-        val n = scores.size
-        if (n == 0) return ThresholdChoice(1.0, 0.0, 0, 0, false)
-        val order = (0 until n).sortedWith(compareBy<Int> { stock[it] }.thenBy { bar[it] })
-        val sorted = scores.sortedArray()
-        val candidates = (0 until 400).map { sorted[(n - 1) - ((n - 1).toLong() * it * it / (399L * 399L)).toInt()] }
-            .distinct().sortedDescending()
-        var okTh = Double.NaN; var okSig = 0; var okHit = 0
-        var bestTh = Double.NaN; var bestPrec = -1.0; var bestSig = 0; var bestHit = 0
-        for (th in candidates) {
-            var sig = 0; var hit = 0
-            var lastStock = -1; var nextAllowed = Int.MIN_VALUE
-            for (k in order) {
-                if (stock[k] != lastStock) { lastStock = stock[k]; nextAllowed = Int.MIN_VALUE }
-                if (bar[k] < nextAllowed || scores[k] < th) continue
-                sig++; hit += labels[k]
-                nextAllowed = bar[k] + cooldown
-            }
-            if (sig < minSignals) continue
-            val prec = hit.toDouble() / sig
-            // 候选阈值从高到低遍历:满足目标的最后一个即信号最多者
-            if (prec >= target) { okTh = th; okSig = sig; okHit = hit }
-            if (prec > bestPrec) { bestPrec = prec; bestTh = th; bestSig = sig; bestHit = hit }
-        }
-        return when {
-            !okTh.isNaN() -> ThresholdChoice(okTh, okHit.toDouble() / okSig, okSig, okHit, true)
-            !bestTh.isNaN() -> ThresholdChoice(bestTh, bestPrec, bestSig, bestHit, false)
-            else -> ThresholdChoice(1.0, 0.0, 0, 0, false)
-        }
-    }
-}
-
-/** 回测中的一个信号(已做同股冷却去重)。 */
-class SignalRecord(
-    val symbol: String,
-    val name: String,
-    val date: Int,
-    val probability: Double,
-    val pattern: Pattern,
-    val outcome: LabelOutcome,
-    val labelMaxGain: Double,
-    /** 与 [Backtester.rules] 一一对应,null 表示买不进。 */
-    val trades: Array<Trade?>,
-    /** 买入日起的每日日期与收盘价,用于组合逐日盯市。 */
-    val pathDates: IntArray = IntArray(0),
-    val pathClose: FloatArray = FloatArray(0),
-) {
-    val hit: Boolean get() = outcome == LabelOutcome.HIT
 }
 
 /**
- * 逐只股票流式回测:不把全市场数据放进内存,单只股票处理完即释放。
+ * 一个候选信号(信号日通过硬条件且概率 ≥ 下限),附带在每组卖出规则下的交易结果。
+ * 用紧凑数组存储:约 1KB/个,十万个候选约 100MB。
  */
-class Backtester(
+class Candidate(
+    val stock: Int,
+    val symbol: String,
+    val name: String,
+    val date: Int,
+    val bar: Int,
+    val prob: Double,
+    val pattern: Pattern,
+    /** 次日一字涨停等原因买不进。 */
+    val tradable: Boolean,
+    val entryPrice: Float,
+    /** 每组规则的毛收益。 */
+    val ret: FloatArray,
+    /** 每组规则的持有天数(卖出日 = pathDates[hold])。 */
+    val hold: ShortArray,
+    val reason: ByteArray,
+    /** 买入日起的每日日期与收盘价,用于组合逐日盯市。 */
+    val pathDates: IntArray,
+    val pathClose: FloatArray,
+) {
+    fun completed(r: Int) = tradable && reason[r].toInt() != ExitReason.DATA_END.ordinal
+    fun exitDate(r: Int) = pathDates[hold[r].toInt().coerceAtMost(pathDates.size - 1)]
+    val entryDate: Int get() = pathDates.firstOrNull() ?: date
+}
+
+/**
+ * 逐只股票流式扫描验证期 + 测试期(一次读完),收集候选信号。不把全市场数据放进内存。
+ */
+class CandidateScanner(
     private val source: DataSource,
     private val stocks: List<StockFile>,
     private val index: IndexContext?,
+    private val market: MarketContext?,
     private val gate: GateParams,
-    private val label: LabelParams,
     val rules: List<ExitRule>,
     private val threads: Int,
-    private val cooldownDays: Int,
 ) {
     private val maxHold = rules.maxOf { it.maxHoldDays }
 
-    fun run(model: GbdtModel, threshold: Double, from: Int, to: Int, progress: (String) -> Unit): List<SignalRecord> {
+    fun run(model: GbdtModel, minProb: Double, from: Int, to: Int, progress: (String) -> Unit): List<Candidate> {
         val pool = Executors.newFixedThreadPool(threads)
         try {
-            val tasks = stocks.map { sf -> Callable { scanStock(sf, model, threshold, from, to) } }
-            val out = ArrayList<SignalRecord>()
+            val out = ArrayList<Candidate>()
             var done = 0
-            // 分批提交,控制同时驻留内存的股票数
-            for (batch in tasks.chunked(threads * 4)) {
-                for (f in pool.invokeAll(batch)) {
-                    out += f.get()
-                    done++
-                }
-                if (done % 500 < threads * 4 || done == tasks.size) progress("回测 $from–$to:$done/${tasks.size} 只,信号 ${out.size},${MemoryGuard.describe()}")
+            for (batch in stocks.indices.chunked(threads * 4)) {
+                for (f in pool.invokeAll(batch.map { k -> Callable { scanStock(k, model, minProb, from, to) } })) out += f.get()
+                done += batch.size
+                if (done % 500 < threads * 4 || done == stocks.size) progress("扫描 $from–$to:$done/${stocks.size} 只,候选 ${out.size},${MemoryGuard.describe()}")
             }
-            out.sortWith(compareBy<SignalRecord> { it.date }.thenByDescending { it.probability })
+            out.sortWith(compareBy<Candidate> { it.date }.thenByDescending { it.prob })
             return out
         } finally {
             pool.shutdownNow()
         }
     }
 
-    private fun scanStock(sf: StockFile, model: GbdtModel, threshold: Double, from: Int, to: Int): List<SignalRecord> {
+    private fun scanStock(k: Int, model: GbdtModel, minProb: Double, from: Int, to: Int): List<Candidate> {
+        val sf = stocks[k]
         val s = try { source.load(sf).series } catch (e: Exception) { null } ?: return emptyList()
         if (s.size < gate.minListedDays + 2) return emptyList()
         val first = s.indexOf(from).let { if (it >= 0) it else -it - 1 }
         if (first >= s.size) return emptyList()
-        val f = try { FeatureEngine.compute(s, index, source.extrasFor(sf.code)) } catch (e: Exception) { return emptyList() }
-        val out = ArrayList<SignalRecord>()
+        val f = try { FeatureEngine.compute(s, index, source.extrasFor(sf.code), market) } catch (e: Exception) { return emptyList() }
+        val out = ArrayList<Candidate>()
         val row = FloatArray(f.values.size)
-        var nextAllowed = 0
         for (i in max(first, 1) until s.size) {
             if (s.date[i] > to) break
-            if (i < nextAllowed || !gate.passes(s, f, i)) continue
+            if (!gate.passes(s, f, i)) continue
             f.row(i, row)
             val p = model.probability(row)
-            if (p < threshold) continue
-            val lr = Labeler.label(s, i, label)
-            val trades = Array(rules.size) { TradeSimulator.simulate(s, i, rules[it]) }
+            if (p < minProb) continue
+            val nr = rules.size
+            val ret = FloatArray(nr) { Float.NaN }
+            val hold = ShortArray(nr)
+            val reason = ByteArray(nr) { ExitReason.DATA_END.ordinal.toByte() }
+            var tradable = false
+            var entry = Float.NaN
+            for (r in 0 until nr) {
+                val t = TradeSimulator.simulate(s, i, rules[r]) ?: break
+                tradable = true
+                entry = t.entryPrice.toFloat()
+                ret[r] = t.ret.toFloat(); hold[r] = t.holdDays.toShort(); reason[r] = t.reason.ordinal.toByte()
+            }
             val e = i + 1
             val last = minOf(s.size - 1, e + maxHold)
-            val pd = if (e <= last) s.date.copyOfRange(e, last + 1) else IntArray(0)
-            val pc = if (e <= last) FloatArray(last - e + 1) { s.close[e + it].toFloat() } else FloatArray(0)
-            out += SignalRecord(s.code.symbol, s.name, s.date[i], p, PatternTagger.tag(f, i), lr.outcome, lr.maxGain, trades, pd, pc)
-            nextAllowed = i + cooldownDays
+            val pd = if (tradable) s.date.copyOfRange(e, last + 1) else IntArray(0)
+            val pc = if (tradable) FloatArray(last - e + 1) { s.close[e + it].toFloat() } else FloatArray(0)
+            out += Candidate(k, s.code.symbol, s.name, s.date[i], i, p, PatternTagger.tag(f, i), tradable, entry, ret, hold, reason, pd, pc)
         }
         return out
     }
 
     companion object {
-        /** 卖出参数网格(只在验证期挑选)。 */
-        fun grid(base: ExitRule): List<ExitRule> {
+        /**
+         * 卖出规则网格(收盘价口径):固定止盈 = 目标收益;动态止盈 = 激活线 × 回撤幅度 × 是否锁定目标利润;
+         * 每种再配 4 档容忍回撤(10% / 15% / 20% / 不设)。
+         */
+        fun grid(label: LabelParams, base: ExitRule): List<ExitRule> {
             val out = LinkedHashSet<ExitRule>()
             out += base
-            for (sl in listOf(0.06, 0.08, 0.10))
-                for (act in listOf(0.10, 0.15, 0.20, 0.30))
-                    for (dd in listOf(0.08, 0.10, 0.15))
-                        out += ExitRule(sl, 0.0, act, dd, base.maxHoldDays)
-            for (sl in listOf(0.06, 0.08, 0.10)) out += ExitRule(sl, 0.30, 0.0, 0.0, base.maxHoldDays)
+            val tp = label.target + label.cost
+            val h = label.horizon
+            for (sl in listOf(0.10, 0.15, 0.20, 0.0)) {
+                out += ExitRule(sl, tp, 0.0, 0.0, 0.0, h)
+                for (act in listOf(0.30, 0.40, 0.50))
+                    for (dd in listOf(0.10, 0.15, 0.20))
+                        for (floor in listOf(0.0, tp))
+                            out += ExitRule(sl, 0.0, act, dd, floor, h)
+            }
             return out.toList()
         }
     }
 }
 
-/** 交易统计。 */
-class TradeStats(trades: List<Trade>, cost: Double) {
-    val n = trades.size
-    val rets = trades.map { it.ret - cost }
+/** 某组规则下一批信号的统计(只统计已完成的周期)。 */
+class TradeStats(signals: List<Candidate>, r: Int, private val label: LabelParams, cutoff: Int = Int.MAX_VALUE) {
+    private val done = signals.filter { it.completed(r) && it.exitDate(r) <= cutoff }
+    val incomplete = signals.count { it.tradable && !(it.completed(r) && it.exitDate(r) <= cutoff) }
+    val untradable = signals.count { !it.tradable }
+    val n = done.size
+    val rets = done.map { it.ret[r] - label.cost }
+    val hits = rets.count { label.isSuccess(it.toDouble()) }
+    val precision = if (n == 0) 0.0 else hits.toDouble() / n
+    val lower95 = Metrics.wilsonLower(hits, n)
     val winRate = if (n == 0) 0.0 else rets.count { it > 0 }.toDouble() / n
-    val gain30Rate = if (n == 0) 0.0 else rets.count { it >= 0.30 }.toDouble() / n
     val mean = if (n == 0) 0.0 else rets.average()
-    val median = if (n == 0) 0.0 else rets.sorted()[n / 2]
-    val worst = rets.minOrNull() ?: 0.0
-    val best = rets.maxOrNull() ?: 0.0
-    val avgHold = if (n == 0) 0.0 else trades.map { it.holdDays }.average()
-    val reasons: Map<ExitReason, Int> = trades.groupingBy { it.reason }.eachCount()
+    val median = if (n == 0) 0.0 else rets.sorted()[n / 2].toDouble()
+    val worst = rets.minOrNull()?.toDouble() ?: 0.0
+    val best = rets.maxOrNull()?.toDouble() ?: 0.0
+    val avgHold = if (n == 0) 0.0 else done.map { it.hold[r].toInt() }.average()
+    val reasons: Map<ExitReason, Int> = done.groupingBy { ExitReason.entries[it.reason[r].toInt()] }.eachCount()
+}
+
+class Selection(
+    val ruleIdx: Int,
+    val threshold: Double,
+    val stats: TradeStats,
+    val achieved: Boolean,
+)
+
+/**
+ * 在验证期**同时**选择卖出规则与概率阈值:
+ * - 同一只股票 cooldown 个交易日内只取第一个信号(买不进的不占冷却期);
+ * - objective=precision:准确率 ≥ 目标的组合中,信号最多者;objective=return:其中扣费后平均收益最高者;
+ * - 都达不到目标时,取信号数 ≥ minSignals 中准确率最高者,并标记未达标。
+ */
+object Selector {
+    /** cands 须已按(日期升序、概率降序)排好,[CandidateScanner.run] 的输出即如此。 */
+    fun dedupe(cands: List<Candidate>, threshold: Double, cooldown: Int): List<Candidate> {
+        val out = ArrayList<Candidate>()
+        val nextAllowed = HashMap<Int, Int>()
+        for (c in cands) {
+            if (c.prob < threshold) continue
+            if (c.bar < (nextAllowed[c.stock] ?: Int.MIN_VALUE)) continue
+            out += c
+            if (c.tradable) nextAllowed[c.stock] = c.bar + cooldown
+        }
+        return out
+    }
+
+    /** cutoff:验证期结束日。卖出日落在测试期内的交易视为未完成,避免测试期价格参与选择。 */
+    fun select(valid: List<Candidate>, rules: List<ExitRule>, label: LabelParams, target: Double, minSignals: Int,
+               cooldown: Int, objective: String, cutoff: Int): Selection {
+        val probs = valid.map { it.prob }.distinct().sortedDescending()
+        if (probs.isEmpty()) return Selection(0, 1.0, TradeStats(emptyList(), 0, label, cutoff), false)
+        val n = probs.size
+        val ths = (0 until 300).map { probs[((n - 1).toLong() * it * it / (299L * 299L)).toInt()] }.distinct()
+        var best: Triple<Int, Double, Double>? = null // rule, threshold, score
+        var bestAchieved = false
+        for (th in ths) {
+            val sel = dedupe(valid, th, cooldown)
+            for (r in rules.indices) {
+                var cnt = 0; var hit = 0; var sum = 0.0
+                for (c in sel) {
+                    if (!c.completed(r) || c.exitDate(r) > cutoff) continue
+                    val net = c.ret[r] - label.cost
+                    cnt++; sum += net
+                    if (label.isSuccess(net.toDouble())) hit++
+                }
+                if (cnt < minSignals) continue
+                val prec = hit.toDouble() / cnt
+                val ok = prec >= target
+                val score = when {
+                    ok && objective == "return" -> 1e6 + sum / cnt
+                    ok -> 1e6 + cnt + sum / cnt / 1e3
+                    else -> prec + cnt * 1e-9
+                }
+                if (ok && !bestAchieved) { bestAchieved = true; best = null }
+                if (bestAchieved && !ok) continue
+                if (best == null || score > best.third) best = Triple(r, th, score)
+            }
+        }
+        val b = best ?: return Selection(0, probs.first(), TradeStats(dedupe(valid, probs.first(), cooldown), 0, label, cutoff), false)
+        return Selection(b.first, b.second, TradeStats(dedupe(valid, b.second, cooldown), b.first, label, cutoff), bestAchieved)
+    }
 }
 
 /**
- * 组合回测:资金均分 maxPositions 份,按信号日期顺序、同日按概率高低占用空闲仓位,
- * 平仓后资金回到该仓位继续复利。净值按收盘价逐日盯市,最大回撤包含持仓中的浮亏。
+ * 组合回测:资金均分 maxPositions 份,按信号先后与概率高低占用空闲仓位,平仓后资金回到该仓位继续复利。
+ * 净值按收盘价逐日盯市,最大回撤包含持仓中的浮亏。未完成的交易按最新收盘价计入。
  */
 class PortfolioResult(val finalEquity: Double, val annualized: Double, val maxDrawdown: Double, val taken: Int, val skipped: Int,
                       val curve: List<Pair<Int, Double>>)
 
 object Portfolio {
-    private class Held(val slot: Int, val base: Double, val trade: Trade, val sig: SignalRecord, val cost: Double)
+    private class Held(val slot: Int, val base: Double, val c: Candidate, val ret: Double, val exitDate: Int)
 
-    fun simulate(signals: List<SignalRecord>, ruleIdx: Int, slots: Int, cost: Double, from: Int, to: Int): PortfolioResult {
-        val slotFree = IntArray(slots) // 该日期之后可再开仓
+    fun simulate(signals: List<Candidate>, r: Int, slots: Int, cost: Double, from: Int): PortfolioResult {
+        val slotFree = IntArray(slots)
         val slotEq = DoubleArray(slots) { 1.0 / slots }
         val held = ArrayList<Held>()
         var skipped = 0
         val heldUntil = HashMap<String, Int>()
-        for (s in signals) {
-            val t = s.trades[ruleIdx] ?: continue
-            if ((heldUntil[s.symbol] ?: 0) >= t.entryDate) { skipped++; continue }
+        for (c in signals) {
+            if (!c.tradable) continue
+            val entry = c.entryDate
+            if ((heldUntil[c.symbol] ?: 0) >= entry) { skipped++; continue }
             var slot = -1
-            for (k in 0 until slots) if (slotFree[k] < t.entryDate) { slot = k; break }
+            for (k in 0 until slots) if (slotFree[k] < entry) { slot = k; break }
             if (slot < 0) { skipped++; continue }
-            held += Held(slot, slotEq[slot], t, s, cost)
-            slotEq[slot] *= 1 + t.ret - cost
-            slotFree[slot] = t.exitDate
-            heldUntil[s.symbol] = t.exitDate
+            val exit = c.exitDate(r)
+            val ret = c.ret[r] - cost
+            held += Held(slot, slotEq[slot], c, ret, exit)
+            slotEq[slot] *= 1 + ret
+            slotFree[slot] = exit
+            heldUntil[c.symbol] = exit
         }
         if (held.isEmpty()) return PortfolioResult(1.0, 0.0, 0.0, 0, skipped, emptyList())
-
-        // 逐日盯市:每个仓位在任一日期的价值 = 已实现部分 + 持仓浮动部分
         val dates = java.util.TreeSet<Int>()
-        for (h in held) for (d in h.sig.pathDates) if (d <= h.trade.exitDate) dates += d
-        val bySlot = held.groupBy { it.slot }.mapValues { (_, l) -> l.sortedBy { it.trade.entryDate } }
+        for (h in held) for (d in h.c.pathDates) if (d <= h.exitDate) dates += d
+        val bySlot = held.groupBy { it.slot }.mapValues { (_, l) -> l.sortedBy { it.c.entryDate } }
         val ptr = IntArray(slots)
         val curve = ArrayList<Pair<Int, Double>>()
         var peak = 1.0; var mdd = 0.0
@@ -268,18 +296,18 @@ object Portfolio {
             for (k in 0 until slots) {
                 val list = bySlot[k]
                 if (list == null) { eq += 1.0 / slots; continue }
-                while (ptr[k] < list.size && list[ptr[k]].trade.exitDate < d) ptr[k]++
+                while (ptr[k] < list.size && list[ptr[k]].exitDate < d) ptr[k]++
                 eq += if (ptr[k] >= list.size) {
-                    val last = list.last(); last.base * (1 + last.trade.ret - last.cost)
+                    val last = list.last(); last.base * (1 + last.ret)
                 } else {
                     val h = list[ptr[k]]
                     when {
-                        d < h.trade.entryDate -> h.base // 尚未买入:现金
-                        d == h.trade.exitDate -> h.base * (1 + h.trade.ret - h.cost)
+                        d < h.c.entryDate -> h.base
+                        d == h.exitDate -> h.base * (1 + h.ret)
                         else -> {
-                            val p = java.util.Arrays.binarySearch(h.sig.pathDates, d)
-                            val px = if (p >= 0) h.sig.pathClose[p].toDouble() else h.trade.entryPrice
-                            h.base * (px / h.trade.entryPrice)
+                            val p = java.util.Arrays.binarySearch(h.c.pathDates, d)
+                            val px = if (p >= 0) h.c.pathClose[p].toDouble() else h.c.entryPrice.toDouble()
+                            h.base * (px / h.c.entryPrice)
                         }
                     }
                 }
@@ -289,8 +317,7 @@ object Portfolio {
             curve += d to eq
         }
         val eq = slotEq.sum()
-        val lastDate = minOf(to, curve.last().first)
-        val years = max(1.0 / 12, com.realu.core.data.Dates.daysBetween(from, maxOf(from, lastDate)) / 365.25)
+        val years = max(1.0 / 12, Dates.daysBetween(from, maxOf(from, curve.last().first)) / 365.25)
         val ann = if (eq > 0) Math.pow(eq, 1 / years) - 1 else -1.0
         return PortfolioResult(eq, ann, mdd, held.size, skipped, curve)
     }

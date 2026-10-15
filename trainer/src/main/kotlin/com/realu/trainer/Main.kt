@@ -16,7 +16,7 @@ realU 主升初期模型训练器
   realu-trainer check    <config.properties>              数据体检(文件数、日期范围、坏数据)
   realu-trainer backtest <config.properties> <model.json> [起始yyyyMMdd] [结束yyyyMMdd]
   realu-trainer predict  <config.properties> <model.json> [日期yyyyMMdd]   列出某日信号
-  realu-trainer demo     <输出目录>                        生成模拟 vipdoc 数据,用于验证安装
+  realu-trainer demo     <输出目录> [--vipdoc-only] [--stocks N] [--days N]   生成模拟通达信数据,用于验证安装
 """
 
 fun main(args: Array<String>) {
@@ -131,18 +131,26 @@ private fun backtest(cfg: Config, args: Array<String>) {
     val source = DataSource(cfg)
     val stocks = source.listStocks()
     val index = source.loadIndex()
-    val bt = Backtester(source, stocks, index, model.gate, model.label, listOf(model.exit), cfg.threads, cfg.int("backtest.cooldownDays", 20))
-    val sig = bt.run(model.gbdt, model.threshold, from, to) { Console.info(it) }
-    val st = TradeStats(sig.mapNotNull { it.trades[0] }, cfg.costPerTrade)
-    val hits = sig.count { it.hit }
-    val end = sig.maxOfOrNull { it.date } ?: from
-    val pf = Portfolio.simulate(sig, 0, cfg.maxPositions, cfg.costPerTrade, from, end)
+    if (model.sectors?.source == "cluster") Console.warn("聚类板块使用模型中的最新归属,对很早的历史区间并不严格(当时的板块划分可能不同)")
+    val (market, _) = MarketPrep.build(cfg, source, stocks, index, fixedSectors = model.sectors, resolveSectors = false)
+    val scanner = CandidateScanner(source, stocks, index, market, model.gate, listOf(model.exit), cfg.threads)
+    val cands = scanner.run(model.gbdt, model.threshold, from, to) { Console.info(it) }
+    val sig = Selector.dedupe(cands, model.threshold, cfg.int("backtest.cooldownDays", 20))
+    val st = TradeStats(sig, 0, model.label)
+    val pf = Portfolio.simulate(sig, 0, cfg.maxPositions, cfg.costPerTrade, from)
     CsvWriter(File(dir, "signals.csv"), cfg.csvEncoding).use { w ->
-        w.row("日期", "代码", "名称", "概率", "类型", "标签结果", "收益", "卖出原因")
-        sig.forEach { s -> val t = s.trades[0]; w.row(s.date, s.symbol, s.name, s.probability, s.pattern.label, s.outcome.name, t?.ret, t?.reason?.label ?: "买不进") }
+        w.row("信号日", "代码", "名称", "概率", "类型", "收益(扣成本)", "是否成功", "卖出原因")
+        sig.forEach { c ->
+            if (!c.tradable) { w.row(c.date, c.symbol, c.name, c.prob, c.pattern.label, "", "", "买不进"); return@forEach }
+            val net = c.ret[0] - model.label.cost
+            w.row(c.date, c.symbol, c.name, c.prob, c.pattern.label, net,
+                if (!c.completed(0)) "未完成" else if (model.label.isSuccess(net.toDouble())) "是" else "否",
+                com.realu.core.strategy.ExitReason.entries[c.reason[0].toInt()].label)
+        }
     }
-    Console.raw("区间 $from ~ $end:信号 ${sig.size},准确率 ${pct(if (sig.isEmpty()) 0.0 else hits.toDouble() / sig.size)}" +
-        "(95%下限 ${pct(Metrics.wilsonLower(hits, sig.size))}),平均收益 ${pct(st.mean)},胜率 ${pct(st.winRate)}")
+    Console.raw("目标:${model.label.describe()};卖出:${model.exit.describe()}")
+    Console.raw("区间 $from ~ ${sig.maxOfOrNull { it.date } ?: from}:已完成信号 ${st.n},准确率 ${pct(st.precision)}" +
+        "(95%下限 ${pct(st.lower95)}),平均收益 ${pct(st.mean)},胜率 ${pct(st.winRate)},未完成 ${st.incomplete}")
     Console.raw("组合:年化 ${pct(pf.annualized)},最大回撤 ${pct(pf.maxDrawdown)};明细 ${File(dir, "signals.csv").absolutePath}")
 }
 
@@ -151,32 +159,37 @@ private fun predict(cfg: Config, args: Array<String>) {
     val model = loadModel(args.getOrNull(2))
     val day = args.getOrNull(3)?.toIntOrNull()
     val source = DataSource(cfg)
+    val stocks = source.listStocks()
     val index = source.loadIndex()
     val engine = SignalEngine(model)
     if (!model.passed) Console.warn("该模型历史检验未达标:${model.metrics["verdict"]}")
-    val out = ArrayList<com.realu.core.strategy.Signal>()
-    for (sf in source.listStocks()) {
-        val s = source.load(sf).series ?: continue
-        val at = if (day == null) s.size - 1 else s.indexOf(day).takeIf { it >= 0 } ?: continue
-        val sig = runCatching { engine.evaluate(s, index, source.extrasFor(sf.code), at) }.getOrNull() ?: continue
-        if (sig.triggered) out += sig
+    val (market, _) = MarketPrep.build(cfg, source, stocks, index, fixedSectors = model.sectors, resolveSectors = false)
+    val out = java.util.Collections.synchronizedList(ArrayList<com.realu.core.strategy.Signal>())
+    MarketPrep.parallelLoad(source, stocks, cfg.threads) { s ->
+        val at = if (day == null) s.size - 1 else s.indexOf(day)
+        if (at >= 0) {
+            val sig = runCatching { engine.evaluate(s, index, source.extrasFor(s.code), at, market = market) }.getOrNull()
+            if (sig != null && sig.triggered) out += sig
+        }
     }
-    out.sortByDescending { it.probability }
+    val list = out.sortedByDescending { it.probability }
     CsvWriter(File(dir, "signals.csv"), cfg.csvEncoding).use { w ->
         w.row("日期", "代码", "名称", "评分", "概率", "类型", "收盘", "止损价", "主要理由")
-        out.forEach { s ->
+        list.forEach { s ->
             w.row(s.date, s.symbol, s.name, s.score, s.probability, s.pattern.label, s.close, s.stopPrice,
                 s.reasons.take(4).joinToString(" | ") { "${it.label}${if (it.impact > 0) "↑" else "↓"}" })
         }
     }
-    Console.raw("信号 ${out.size} 个:")
-    out.take(30).forEach { Console.raw("  ${it.date} ${it.symbol} ${it.name} 评分${it.score} ${it.pattern.label} 收盘${"%.2f".format(it.close)}") }
+    Console.raw("信号 ${list.size} 个:")
+    list.take(30).forEach { Console.raw("  ${it.date} ${it.symbol} ${it.name} 评分${it.score} ${it.pattern.label} 收盘${"%.2f".format(it.close)}") }
     Console.raw("明细:${File(dir, "signals.csv").absolutePath}")
 }
 
 private fun demo(args: Array<String>) {
     val dir = File(args.getOrNull(1) ?: "demo-data")
-    val n = SyntheticData.writeVipdoc(dir, stocks = 300, days = 2600, seed = 7)
-    Console.info("已在 ${dir.absolutePath} 生成 $n 个模拟 .day 文件(含指数 sh000001)。")
-    Console.info("把配置中的 tdx.vipdoc 指向该目录即可试跑 train,用于验证环境;模拟数据的结果没有任何投资意义。")
+    val withHq = !args.contains("--vipdoc-only")
+    fun opt(name: String, def: Int) = args.indexOf(name).let { if (it >= 0) args.getOrNull(it + 1)?.toIntOrNull() ?: def else def }
+    val n = SyntheticData.writeTdx(dir, stocks = opt("--stocks", 300), days = opt("--days", 2600), seed = 7, withHqCache = withHq)
+    Console.info("已在 ${dir.absolutePath} 生成 $n 个模拟 .day 文件(含指数 sh000001)" + if (withHq) "与 T0002/hq_cache 行业/概念文件。" else "。")
+    Console.info("把配置中的 tdx.vipdoc 指向 ${File(dir, "vipdoc").absolutePath} 即可试跑 train,用于验证环境;模拟数据的结果没有任何投资意义。")
 }
