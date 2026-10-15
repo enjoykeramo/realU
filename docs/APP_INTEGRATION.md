@@ -8,7 +8,7 @@ APP 端与训练器**共用 `core` 模块**计算特征和推理,保证口径一
 `core` 是纯 Kotlin 模块,没有第三方依赖。两种方式任选:
 
 - **源码引入**:把 `core/` 目录复制到 Android 工程,`settings.gradle.kts` 中 `include(":core")`,app 模块 `implementation(project(":core"))`。
-- **jar 引入**:`gradlew :core:jar` 生成 `core/build/libs/core-1.0.0.jar`,放入 `app/libs/`。
+- **jar 引入**:`gradle :core:jar` 生成 `core/build/libs/core-1.0.0.jar`,放入 `app/libs/`。
 
 要求:`minSdk ≥ 26`(用到 `java.time`),或开启 core library desugaring。
 
