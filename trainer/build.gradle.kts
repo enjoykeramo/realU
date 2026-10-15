@@ -33,10 +33,19 @@ val buildInfo = tasks.register("buildInfo") {
     val ver = project.version.toString()
     outputs.dir(out)
     outputs.upToDateWhen { false }
+    val root = rootProject.projectDir
     doLast {
+        // 记录源码的 git 提交号:确认编译的确实是最新代码(git 不可用时写 unknown)
+        fun git(vararg a: String): String? = runCatching {
+            val p = ProcessBuilder(listOf("git") + a).directory(root).redirectErrorStream(true).start()
+            val t = p.inputStream.bufferedReader().readText().trim()
+            if (p.waitFor() == 0) t else null
+        }.getOrNull()
+        val commit = git("rev-parse", "--short", "HEAD") ?: "unknown"
+        val dirty = git("status", "--porcelain", "--untracked-files=no")?.isNotEmpty() == true
         val f = out.get().file("realu-build.properties").asFile
         f.parentFile.mkdirs()
-        f.writeText("version=$ver\nbuildTime=${LocalDateTime.now().withNano(0)}\n")
+        f.writeText("version=$ver\nbuildTime=${LocalDateTime.now().withNano(0)}\ncommit=$commit${if (dirty) "+local-changes" else ""}\n")
     }
 }
 sourceSets.main { resources.srcDir(buildInfo) }

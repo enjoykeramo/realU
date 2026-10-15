@@ -202,6 +202,6 @@ private fun demo(args: Array<String>) {
 fun versionText(): String {
     val p = java.util.Properties()
     object {}.javaClass.getResourceAsStream("/realu-build.properties")?.use { p.load(it) }
-    return "realU trainer ${p.getProperty("version", "dev")}  build ${p.getProperty("buildTime", "unknown")}  " +
+    return "realU trainer ${p.getProperty("version", "dev")}  commit ${p.getProperty("commit", "unknown")}  build ${p.getProperty("buildTime", "unknown")}  " +
         "Java ${System.getProperty("java.version")}"
 }
