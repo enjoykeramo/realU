@@ -18,22 +18,25 @@ import kotlin.math.max
 import kotlin.math.sqrt
 
 object Metrics {
+    /** AUC = P(正样本得分 > 负样本得分),并列计 0.5。只用原始类型数组排序,50 万样本约几十毫秒。 */
     fun auc(scores: DoubleArray, labels: IntArray): Double {
-        val n = scores.size
-        val order = (0 until n).sortedBy { scores[it] }
-        var rankSum = 0.0
-        var pos = 0L
-        var i = 0
-        while (i < n) {
-            var j = i
-            while (j + 1 < n && scores[order[j + 1]] == scores[order[i]]) j++
-            val avgRank = (i + j) / 2.0 + 1
-            for (k in i..j) if (labels[order[k]] == 1) { rankSum += avgRank; pos++ }
-            i = j + 1
+        var np = 0
+        for (l in labels) if (l == 1) np++
+        val nn = labels.size - np
+        if (np == 0 || nn == 0) return Double.NaN
+        val pos = DoubleArray(np); val neg = DoubleArray(nn)
+        var a = 0; var b = 0
+        for (i in scores.indices) if (labels[i] == 1) pos[a++] = scores[i] else neg[b++] = scores[i]
+        pos.sort(); neg.sort()
+        var lo = 0; var hi = 0
+        var sum = 0.0
+        for (x in pos) {
+            while (lo < nn && neg[lo] < x) lo++
+            if (hi < lo) hi = lo
+            while (hi < nn && neg[hi] <= x) hi++
+            sum += lo + (hi - lo) * 0.5
         }
-        val neg = n - pos
-        if (pos == 0L || neg == 0L) return Double.NaN
-        return (rankSum - pos * (pos + 1) / 2.0) / (pos * neg)
+        return sum / (np.toDouble() * nn)
     }
 
     /** Wilson 区间下限(95%):样本少时,"10 个信号中 10 个命中"并不代表真实准确率 100%。 */
@@ -96,13 +99,21 @@ class CandidateScanner(
 ) {
     private val maxHold = rules.maxOf { it.maxHoldDays }
 
-    fun run(model: GbdtModel, minProb: Double, from: Int, to: Int, progress: (String) -> Unit): List<Candidate> {
+    /** 一段扫描:日期区间 [from, to] 用 model 评分,只保留概率 ≥ minProb 的候选。 */
+    class Segment(val model: GbdtModel, val minProb: Double, val from: Int, val to: Int)
+
+    fun run(model: GbdtModel, minProb: Double, from: Int, to: Int, progress: (String) -> Unit): List<Candidate> =
+        run(listOf(Segment(model, minProb, from, to)), progress)
+
+    /** 多段扫描(例如滚动重训的每年一个模型)共用一次读数据和特征计算。 */
+    fun run(segments: List<Segment>, progress: (String) -> Unit): List<Candidate> {
         val pool = Executors.newFixedThreadPool(threads)
+        val from = segments.minOf { it.from }; val to = segments.maxOf { it.to }
         try {
             val out = ArrayList<Candidate>()
             var done = 0
             for (batch in stocks.indices.chunked(threads * 4)) {
-                for (f in pool.invokeAll(batch.map { k -> Callable { scanStock(k, model, minProb, from, to) } })) out += f.get()
+                for (f in pool.invokeAll(batch.map { k -> Callable { scanStock(k, segments, from) } })) out += f.get()
                 done += batch.size
                 if (done % 500 < threads * 4 || done == stocks.size) progress("扫描 $from–$to:$done/${stocks.size} 只,候选 ${out.size},${MemoryGuard.describe()}")
             }
@@ -113,7 +124,7 @@ class CandidateScanner(
         }
     }
 
-    private fun scanStock(k: Int, model: GbdtModel, minProb: Double, from: Int, to: Int): List<Candidate> {
+    private fun scanStock(k: Int, segments: List<Segment>, from: Int): List<Candidate> {
         val sf = stocks[k]
         val s = try { source.load(sf).series } catch (e: Exception) { null } ?: return emptyList()
         if (s.size < gate.minListedDays + 2) return emptyList()
@@ -123,11 +134,11 @@ class CandidateScanner(
         val out = ArrayList<Candidate>()
         val row = FloatArray(f.values.size)
         for (i in max(first, 1) until s.size) {
-            if (s.date[i] > to) break
+            val seg = segments.firstOrNull { s.date[i] >= it.from && s.date[i] <= it.to } ?: continue
             if (!gate.passes(s, f, i)) continue
             f.row(i, row)
-            val p = model.probability(row)
-            if (p < minProb) continue
+            val p = seg.model.probability(row)
+            if (p < seg.minProb) continue
             val nr = rules.size
             val ret = FloatArray(nr) { Float.NaN }
             val hold = ShortArray(nr)
@@ -190,26 +201,39 @@ class TradeStats(signals: List<Candidate>, r: Int, private val label: LabelParam
     val reasons: Map<ExitReason, Int> = done.groupingBy { ExitReason.entries[it.reason[r].toInt()] }.eachCount()
 }
 
+/** 选出的配置:卖出规则 + 每种启动类型各自的概率阈值(> 1 表示该类型不发信号)。 */
 class Selection(
     val ruleIdx: Int,
-    val threshold: Double,
+    val thresholds: DoubleArray,
     val stats: TradeStats,
     val achieved: Boolean,
-)
+    val perPattern: Map<Pattern, TradeStats>,
+) {
+    fun threshold(p: Pattern): Double = thresholds[p.ordinal]
+    fun enabled(p: Pattern): Boolean = thresholds[p.ordinal] <= 1.0
+    /** 所有启用类型中最低的阈值(扫描候选时的下限)。 */
+    val minThreshold: Double get() = thresholds.filter { it <= 1.0 }.minOrNull() ?: 1.0
+}
 
 /**
- * 在验证期**同时**选择卖出规则与概率阈值:
+ * 在验证期**同时**选择卖出规则与每种启动类型的概率阈值:
  * - 同一只股票 cooldown 个交易日内只取第一个信号(买不进的不占冷却期);
- * - objective=precision:准确率 ≥ 目标的组合中,信号最多者;objective=return:其中扣费后平均收益最高者;
- * - 都达不到目标时,取信号数 ≥ minSignals 中准确率最高者,并标记未达标。
+ * - 不同启动类型(箱体突破 / 超跌反弹 / 趋势波段 / 其他)成功率差异很大,各自选阈值;
+ * - 有类型能达到目标准确率时:只启用达标的类型,objective=precision 取信号最多、objective=return 取平均收益最高;
+ * - 都达不到时:每种类型取"95% 置信下限"最高的阈值,再按下限从高到低逐个加入,只要整体下限还在提高 ——
+ *   避免为了凑信号数选出大量低质量信号,也避免只剩几个信号的偶然结果。
  */
 object Selector {
+    const val DISABLED = 1.01
+
     /** cands 须已按(日期升序、概率降序)排好,[CandidateScanner.run] 的输出即如此。 */
-    fun dedupe(cands: List<Candidate>, threshold: Double, cooldown: Int): List<Candidate> {
+    fun dedupe(cands: List<Candidate>, threshold: Double, cooldown: Int): List<Candidate> = dedupe(cands, { threshold }, cooldown)
+
+    fun dedupe(cands: List<Candidate>, threshold: (Candidate) -> Double, cooldown: Int): List<Candidate> {
         val out = ArrayList<Candidate>()
         val nextAllowed = HashMap<Int, Int>()
         for (c in cands) {
-            if (c.prob < threshold) continue
+            if (c.prob < threshold(c)) continue
             if (c.bar < (nextAllowed[c.stock] ?: Int.MIN_VALUE)) continue
             out += c
             if (c.tradable) nextAllowed[c.stock] = c.bar + cooldown
@@ -217,41 +241,134 @@ object Selector {
         return out
     }
 
+    fun dedupe(cands: List<Candidate>, sel: Selection, cooldown: Int): List<Candidate> =
+        dedupe(cands, { sel.threshold(it.pattern) }, cooldown)
+
+    private class Cell(val th: Double, val cnt: IntArray, val hit: IntArray, val sum: DoubleArray)
+
     /** cutoff:验证期结束日。卖出日落在测试期内的交易视为未完成,避免测试期价格参与选择。 */
     fun select(valid: List<Candidate>, rules: List<ExitRule>, label: LabelParams, target: Double, minSignals: Int,
-               cooldown: Int, objective: String, cutoff: Int): Selection {
-        val probs = valid.map { it.prob }.distinct().sortedDescending()
-        if (probs.isEmpty()) return Selection(0, 1.0, TradeStats(emptyList(), 0, label, cutoff), false)
-        val n = probs.size
-        val ths = (0 until 300).map { probs[((n - 1).toLong() * it * it / (299L * 299L)).toInt()] }.distinct()
-        var best: Triple<Int, Double, Double>? = null // rule, threshold, score
-        var bestAchieved = false
-        for (th in ths) {
-            val sel = dedupe(valid, th, cooldown)
-            for (r in rules.indices) {
-                var cnt = 0; var hit = 0; var sum = 0.0
-                for (c in sel) {
+               minPerPattern: Int, cooldown: Int, objective: String, cutoff: Int, perPattern: Boolean = true): Selection {
+        val nr = rules.size
+        // 分组:每种启动类型一组;不分类型时所有候选一组、共用一个阈值
+        val groups: List<List<Pattern>> = if (perPattern) Pattern.entries.map { listOf(it) } else listOf(Pattern.entries.toList())
+        val pats = groups
+        // 每组、每个候选阈值、每组规则下的(信号数, 成功数, 收益和)
+        val cells = groups.map { g ->
+            val cp = valid.filter { it.pattern in g }
+            val probs = cp.map { it.prob }.distinct().sortedDescending()
+            val n = probs.size
+            val ths = if (n == 0) emptyList() else (0 until 200).map { probs[((n - 1).toLong() * it * it / (199L * 199L)).toInt()] }.distinct()
+            ths.map { th ->
+                val cnt = IntArray(nr); val hit = IntArray(nr); val sum = DoubleArray(nr)
+                for (c in dedupe(cp, th, cooldown)) for (r in 0 until nr) {
                     if (!c.completed(r) || c.exitDate(r) > cutoff) continue
                     val net = c.ret[r] - label.cost
-                    cnt++; sum += net
-                    if (label.isSuccess(net.toDouble())) hit++
+                    cnt[r]++; sum[r] += net
+                    if (label.isSuccess(net.toDouble())) hit[r]++
                 }
-                if (cnt < minSignals) continue
-                val prec = hit.toDouble() / cnt
-                val ok = prec >= target
-                val score = when {
-                    ok && objective == "return" -> 1e6 + sum / cnt
-                    ok -> 1e6 + cnt + sum / cnt / 1e3
-                    else -> prec + cnt * 1e-9
-                }
-                if (ok && !bestAchieved) { bestAchieved = true; best = null }
-                if (bestAchieved && !ok) continue
-                if (best == null || score > best.third) best = Triple(r, th, score)
+                Cell(th, cnt, hit, sum)
             }
         }
-        val b = best ?: return Selection(0, probs.first(), TradeStats(dedupe(valid, probs.first(), cooldown), 0, label, cutoff), false)
-        return Selection(b.first, b.second, TradeStats(dedupe(valid, b.second, cooldown), b.first, label, cutoff), bestAchieved)
+
+        var bestRule = 0
+        var bestTh = DoubleArray(groups.size) { DISABLED }
+        var bestScore = Double.NEGATIVE_INFINITY
+        var bestAchieved = false
+        for (r in 0 until nr) {
+            // 1) 能达标的类型
+            val ok = pats.indices.mapNotNull { pi ->
+                cells[pi].filter { it.cnt[r] >= minPerPattern && it.hit[r].toDouble() / it.cnt[r] >= target }
+                    .maxByOrNull { if (objective == "return") it.sum[r] / it.cnt[r] else it.cnt[r] + it.sum[r] / it.cnt[r] / 1e3 }
+                    ?.let { pi to it }
+            }
+            val okCnt = ok.sumOf { it.second.cnt[r] }
+            val th = DoubleArray(pats.size) { DISABLED }
+            val achieved: Boolean
+            val score: Double
+            if (ok.isNotEmpty() && okCnt >= minSignals) {
+                achieved = true
+                ok.forEach { (pi, c) -> th[pi] = c.th }
+                score = 1e9 + if (objective == "return") ok.sumOf { it.second.sum[r] } / okCnt else okCnt.toDouble()
+            } else {
+                achieved = false
+                // 2) 达不到:按置信下限贪心组合
+                val bestPer = pats.indices.mapNotNull { pi ->
+                    cells[pi].filter { it.cnt[r] >= minPerPattern }
+                        .maxByOrNull { Metrics.wilsonLower(it.hit[r], it.cnt[r]) }?.let { pi to it }
+                }.sortedByDescending { (_, c) -> Metrics.wilsonLower(c.hit[r], c.cnt[r]) }
+                var cnt = 0; var hit = 0; var lb = -1.0
+                for ((pi, c) in bestPer) {
+                    val nl = Metrics.wilsonLower(hit + c.hit[r], cnt + c.cnt[r])
+                    if (cnt + c.cnt[r] >= minSignals && nl <= lb) continue
+                    cnt += c.cnt[r]; hit += c.hit[r]; th[pi] = c.th
+                    lb = Metrics.wilsonLower(hit, cnt)
+                }
+                if (cnt < minSignals) continue
+                score = lb
+            }
+            if (achieved && !bestAchieved) { bestAchieved = true; bestScore = Double.NEGATIVE_INFINITY }
+            if (bestAchieved && !achieved) continue
+            if (score > bestScore) { bestScore = score; bestRule = r; bestTh = th }
+        }
+        val perPat = DoubleArray(Pattern.entries.size) { DISABLED }
+        groups.forEachIndexed { gi, g -> g.forEach { perPat[it.ordinal] = bestTh[gi] } }
+        if (bestAchieved && perPattern) {
+            // 各类型是分别去重选的阈值;合并后同一只股票的信号会互相占用冷却期,个别类型的准确率可能掉到目标以下。
+            // 逐个检查:不达标的类型提高阈值,仍不行就不启用。
+            val thsOf = cells.map { list -> list.map { it.th }.sorted() }
+            for (iter in 0 until 20) {
+                val signals = dedupe(valid, { perPat[it.pattern.ordinal] }, cooldown)
+                fun ok(p: Pattern, sig: List<Candidate>): Boolean {
+                    val st = TradeStats(sig.filter { it.pattern == p }, bestRule, label, cutoff)
+                    return st.n >= minPerPattern && st.precision >= target
+                }
+                val bad = Pattern.entries.firstOrNull { perPat[it.ordinal] <= 1.0 && !ok(it, signals) } ?: break
+                var fixed = false
+                for (t in thsOf[bad.ordinal].filter { it > perPat[bad.ordinal] }) {
+                    val trial = perPat.copyOf().also { it[bad.ordinal] = t }
+                    if (ok(bad, dedupe(valid, { c -> trial[c.pattern.ordinal] }, cooldown))) { perPat[bad.ordinal] = t; fixed = true; break }
+                }
+                if (!fixed) perPat[bad.ordinal] = DISABLED
+            }
+        }
+        val sel = finish(valid, Selection(bestRule, perPat, TradeStats(emptyList(), bestRule, label, cutoff), bestAchieved, emptyMap()),
+            label, cooldown, cutoff)
+        // 修正后再核对整体是否仍达标
+        val stillOk = bestAchieved && sel.stats.n >= minSignals && sel.stats.precision >= target
+        return Selection(sel.ruleIdx, sel.thresholds, sel.stats, stillOk, sel.perPattern)
     }
+
+    /** 用选定阈值重新统计整体与各类型表现。 */
+    fun finish(cands: List<Candidate>, sel: Selection, label: LabelParams, cooldown: Int, cutoff: Int = Int.MAX_VALUE): Selection {
+        val signals = dedupe(cands, sel, cooldown)
+        val per = Pattern.entries.filter { sel.enabled(it) }
+            .associateWith { p -> TradeStats(signals.filter { it.pattern == p }, sel.ruleIdx, label, cutoff) }
+        return Selection(sel.ruleIdx, sel.thresholds, TradeStats(signals, sel.ruleIdx, label, cutoff), sel.achieved, per)
+    }
+}
+
+/**
+ * 不同模型(验证用模型 / 每年重训的模型 / 最终导出模型)的概率刻度不同,阈值不能直接照搬。
+ * 按"分位数"迁移:在验证期,阈值 th 对应"该类型候选中前 q 比例";新模型在参考期(最近一年)候选上取同样的前 q 比例。
+ */
+object ThresholdMapper {
+    fun fractions(sel: Selection, probs: DoubleArray, patterns: ByteArray): DoubleArray =
+        DoubleArray(Pattern.entries.size) { pi ->
+            if (sel.thresholds[pi] > 1.0) return@DoubleArray -1.0
+            var n = 0; var above = 0
+            for (k in probs.indices) if (patterns[k].toInt() == pi) { n++; if (probs[k] >= sel.thresholds[pi]) above++ }
+            if (n == 0) -1.0 else above.toDouble() / n
+        }
+
+    fun map(fractions: DoubleArray, probs: DoubleArray, patterns: ByteArray): DoubleArray =
+        DoubleArray(fractions.size) { pi ->
+            val q = fractions[pi]
+            if (q < 0) return@DoubleArray Selector.DISABLED
+            val vals = probs.indices.filter { patterns[it].toInt() == pi }.map { probs[it] }.sortedDescending()
+            if (vals.isEmpty()) Selector.DISABLED
+            else vals[((vals.size * q).toInt() - 1).coerceIn(0, vals.size - 1)]
+        }
 }
 
 /**

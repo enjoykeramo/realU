@@ -24,12 +24,19 @@ data class GbdtParams(
     /** 正样本权重(类别不平衡时可调大;阈值在验证集上另行选定,不影响准确率口径)。 */
     val positiveWeight: Double = 1.0,
     val seed: Long = 1,
+    /** 早停指标:auc(默认,不受不同时期成功率高低的影响)或 logloss。 */
+    val earlyStopMetric: String = "auc",
+    /** 每多少轮评估一次验证集。 */
+    val evalEvery: Int = 5,
+    /** 不参与训练的特征(特征组筛选用);模型输入维度不变,APP 无需改动。 */
+    val excluded: BooleanArray = BooleanArray(0),
 )
 
 class TrainResult(
     val model: GbdtModel,
     val bestRound: Int,
-    val bestValidLoss: Double,
+    /** 验证集最优指标(AUC 或 logloss);没有验证集时为 NaN。 */
+    val bestValidScore: Double,
     /** 每个特征的累计分裂增益。 */
     val gainImportance: DoubleArray,
     val history: List<Pair<Double, Double>>,
@@ -41,9 +48,16 @@ class TrainResult(
  * - 直方图做差加速(小子节点建直方图,大子节点 = 父 − 小);
  * - 缺失值单独成箱,分裂时自动学习缺失值走向;
  * - 行/列采样 + 验证集早停,防止过拟合;
- * - 特征维度上并行构建直方图(ForkJoin)。
+ * - 特征维度上并行构建直方图(ForkJoin);
+ * - 样本权重 rowWeight(按交易日平衡,防止某几个火爆交易日的成千上万个样本主导模型,让模型"记住行情阶段")。
  */
-class GbdtTrainer(private val ds: Dataset, private val binner: Binner, private val p: GbdtParams, threads: Int) {
+class GbdtTrainer(
+    private val ds: Dataset,
+    private val binner: Binner,
+    private val p: GbdtParams,
+    threads: Int,
+    private val rowWeight: FloatArray? = null,
+) {
     private val nf = ds.bins.size
     private val pool = ForkJoinPool(threads)
     private val offsets = IntArray(nf + 1).also { for (f in 0 until nf) it[f + 1] = it[f] + binner.nBins[f] }
@@ -86,8 +100,11 @@ class GbdtTrainer(private val ds: Dataset, private val binner: Binner, private v
         val binTrees = ArrayList<NodeBuf>()
         val importance = DoubleArray(nf)
         val history = ArrayList<Pair<Double, Double>>()
-        var best = Double.MAX_VALUE
-        var bestRound = 0
+        val useAuc = p.earlyStopMetric.equals("auc", true)
+        val hasValid = validIdx.isNotEmpty()
+        var best = if (useAuc) Double.NEGATIVE_INFINITY else Double.MAX_VALUE
+        var bestRound = if (hasValid) 0 else p.rounds
+        val usable = BooleanArray(nf) { binner.nBins[it] > 2 && !(p.excluded.getOrNull(it) ?: false) }
         val rows = IntArray(trainIdx.size) // 存放 trainIdx 的位置(0 until n),便于对齐 grad
         val sampledFeatures = BooleanArray(nf)
 
@@ -104,32 +121,39 @@ class GbdtTrainer(private val ds: Dataset, private val binner: Binner, private v
             for (k in trainIdx.indices) if (p.rowSample >= 1.0 || rnd.nextDouble() < p.rowSample) rows[n++] = k
             // 列采样
             var anyF = false
-            for (f in 0 until nf) { sampledFeatures[f] = binner.nBins[f] > 2 && (p.featureSample >= 1.0 || rnd.nextDouble() < p.featureSample); anyF = anyF || sampledFeatures[f] }
-            if (!anyF) for (f in 0 until nf) sampledFeatures[f] = binner.nBins[f] > 2
+            for (f in 0 until nf) { sampledFeatures[f] = usable[f] && (p.featureSample >= 1.0 || rnd.nextDouble() < p.featureSample); anyF = anyF || sampledFeatures[f] }
+            if (!anyF) for (f in 0 until nf) sampledFeatures[f] = usable[f]
 
             val buf = buildTree(rows, n, trainIdx, grad, hess, sampledFeatures, importance)
             binTrees += buf
             // 更新预测值
             updateScores(buf, trainIdx, fTrain)
-            updateScores(buf, validIdx, fValid)
+            if (hasValid) updateScores(buf, validIdx, fValid)
             trees += toTree(buf)
 
-            val trainLoss = logLoss(trainIdx, fTrain)
+            if (!hasValid) {
+                if ((round + 1) % 100 == 0) log("第 ${round + 1}/${p.rounds} 轮  ${MemoryGuard.describe()}")
+                continue
+            }
+            if ((round + 1) % p.evalEvery != 0 && round != 0) continue
             val validLoss = logLoss(validIdx, fValid)
-            history += trainLoss to validLoss
-            if (validLoss < best - 1e-7) { best = validLoss; bestRound = round + 1 }
-            if ((round + 1) % 25 == 0 || round == 0) {
-                log("第 ${round + 1} 轮  训练 logloss ${"%.5f".format(trainLoss)}  验证 logloss ${"%.5f".format(validLoss)}  ${MemoryGuard.describe()}")
+            val validAuc = if (useAuc) Metrics.auc(DoubleArray(validIdx.size) { fValid[it] }, IntArray(validIdx.size) { y[validIdx[it]].toInt() }) else Double.NaN
+            history += validLoss to validAuc
+            val score = if (useAuc) validAuc else validLoss
+            val improved = if (useAuc) score > best + 1e-5 else score < best - 1e-7
+            if (improved) { best = score; bestRound = round + 1 }
+            if ((round + 1) % 50 == 0 || round == 0) {
+                log("第 ${round + 1} 轮  验证 logloss ${"%.5f".format(validLoss)}" + (if (useAuc) "  AUC ${"%.4f".format(validAuc)}" else "") + "  ${MemoryGuard.describe()}")
             }
             if (round + 1 - bestRound >= p.earlyStopping) {
-                log("验证集连续 ${p.earlyStopping} 轮未改善,早停于第 ${round + 1} 轮,采用第 $bestRound 轮")
+                log("验证集连续 ${p.earlyStopping} 轮未改善,早停于第 ${round + 1} 轮,采用第 $bestRound 轮(验证${if (useAuc) " AUC" else " logloss"} ${"%.4f".format(best)})")
                 break
             }
         }
         val keep = max(1, bestRound)
         finalBinTrees = binTrees.subList(0, keep).toList()
         baseScore = base
-        return TrainResult(GbdtModel(base, trees.subList(0, keep).toList()), keep, best, importance, history)
+        return TrainResult(GbdtModel(base, trees.subList(0, keep).toList()), keep, if (hasValid) best else Double.NaN, importance, history)
     }
 
     private var finalBinTrees: List<NodeBuf> = emptyList()
@@ -145,7 +169,8 @@ class GbdtTrainer(private val ds: Dataset, private val binner: Binner, private v
 
     fun close() = pool.shutdown()
 
-    private fun weight(r: Int): Double = if (ds.label[r].toInt() == 1) p.positiveWeight else 1.0
+    private fun weight(r: Int): Double =
+        (rowWeight?.get(r)?.toDouble() ?: 1.0) * (if (ds.label[r].toInt() == 1) p.positiveWeight else 1.0)
 
     private fun logLoss(idx: IntArray, f: DoubleArray): Double {
         if (idx.isEmpty()) return Double.NaN

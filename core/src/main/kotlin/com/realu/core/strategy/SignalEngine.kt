@@ -71,6 +71,7 @@ class SignalEngine(val model: RealuModel) {
                 val d = FeatureDefs.ALL[it]
                 Reason(d.name, d.label, d.group.label, x[it], contrib[it])
             }
+        val pattern = PatternTagger.tag(f, at)
         val c = series.close[at]
         val ex = model.exit
         return Signal(
@@ -79,9 +80,9 @@ class SignalEngine(val model: RealuModel) {
             date = series.date[at],
             close = c,
             probability = p,
-            score = model.score(p),
-            triggered = p >= model.threshold,
-            pattern = PatternTagger.tag(f, at),
+            score = model.score(p, pattern.name),
+            triggered = p >= model.thresholdFor(pattern.name),
+            pattern = pattern,
             reasons = reasons,
             stopPrice = if (ex.stopLoss > 0) c * (1 - ex.stopLoss) else 0.0,
             takeProfitPrice = if (ex.takeProfit > 0) c * (1 + ex.takeProfit) else null,

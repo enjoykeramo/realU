@@ -132,10 +132,16 @@ class RealuModel(
     val dataInfo: Map<String, Any?>,
     /** 训练时最后一段的板块/概念归属,APP 用它计算板块与概念强度特征。 */
     val sectors: SectorMap? = null,
+    /** 每种启动类型(Pattern.name)各自的概率阈值;> 1 表示该类型不发信号。缺省时都用 [threshold]。 */
+    val patternThresholds: Map<String, Double> = emptyMap(),
 ) {
-    /** APP 展示用 0–100 分:阈值映射到 60 分(与原型"入选线 ≥ 60"一致)。 */
-    fun score(probability: Double): Int {
-        val th = threshold.coerceIn(1e-6, 1 - 1e-6)
+    fun thresholdFor(pattern: String): Double = patternThresholds[pattern] ?: threshold
+
+    /** APP 展示用 0–100 分:该类型的阈值映射到 60 分(与原型"入选线 ≥ 60"一致)。 */
+    fun score(probability: Double, pattern: String? = null): Int {
+        val raw = pattern?.let { thresholdFor(it) } ?: threshold
+        if (raw > 1.0) return (probability * 59).toInt().coerceIn(0, 59) // 该类型未启用,永远不到入选线
+        val th = raw.coerceIn(1e-6, 1 - 1e-6)
         val s = if (probability <= th) probability / th * 60 else 60 + (probability - th) / (1 - th) * 40
         return s.toInt().coerceIn(0, 100)
     }
@@ -156,6 +162,7 @@ class RealuModel(
             "createdAt" to createdAt,
             "passed" to passed,
             "threshold" to threshold,
+            "patternThresholds" to patternThresholds,
             "scoreLine" to 60,
             "gate" to linkedMapOf(
                 "minListedDays" to gate.minListedDays, "minAmount5" to gate.minAmount5,
@@ -235,6 +242,7 @@ class RealuModel(
                 metrics = root["metrics"] as? Map<String, Any?> ?: emptyMap(),
                 factorWeights = display.list("scoreFactors").associate { val m = it.asJsonMap(); m.str("name") to m.int("weight") },
                 dataInfo = root["data"] as? Map<String, Any?> ?: emptyMap(),
+                patternThresholds = (root["patternThresholds"] as? Map<String, Any?>)?.mapValues { it.value.asDouble() } ?: emptyMap(),
                 sectors = (root["sectors"] as? Map<String, Any?>)?.let { sec ->
                     SectorMap.static(
                         source = sec.str("source"),

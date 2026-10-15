@@ -139,7 +139,7 @@ private fun backtest(cfg: Config, args: Array<String>) {
     val (market, _) = MarketPrep.build(cfg, source, stocks, index, fixedSectors = model.sectors, resolveSectors = false)
     val scanner = CandidateScanner(source, stocks, index, market, model.gate, listOf(model.exit), cfg.threads)
     val cands = scanner.run(model.gbdt, model.threshold, from, to) { Console.info(it) }
-    val sig = Selector.dedupe(cands, model.threshold, cfg.int("backtest.cooldownDays", 20))
+    val sig = Selector.dedupe(cands, { c -> model.thresholdFor(c.pattern.name) }, cfg.int("backtest.cooldownDays", 20))
     val st = TradeStats(sig, 0, model.label)
     val pf = Portfolio.simulate(sig, 0, cfg.maxPositions, cfg.costPerTrade, from)
     CsvWriter(File(dir, "signals.csv"), cfg.csvEncoding).use { w ->

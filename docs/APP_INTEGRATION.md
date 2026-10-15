@@ -40,7 +40,8 @@ val engine = SignalEngine(model)
 val market = engine.buildMarket(TradingCalendar(indexSeries.date), allSeries.asSequence())
 val signal = engine.evaluate(series, indexContext, market = market)   // 默认评估最后一个交易日
 if (signal != null && signal.triggered) {
-    // signal.score       0–100 分,阈值映射为 60 分(与原型"入选线 ≥ 60"一致)
+    // signal.score       0–100 分,该启动类型的阈值映射为 60 分(与原型"入选线 ≥ 60"一致)
+    // signal.triggered   已按 patternThresholds 判断;未启用的类型永远不触发
     // signal.pattern     箱体突破 / 超跌反弹 / 趋势波段 / 其他
     // signal.reasons     影响最大的 8 个特征:label、group、value、impact(>0 加分,<0 减分)
     // signal.stopPrice   以收盘价估算的止损价(实际按次日买入价重算)
@@ -72,7 +73,9 @@ if (signal != null && signal.triggered) {
   "format": "realu-model", "formatVersion": 2,
   "name": "主升初期", "strategyId": "i", "createdAt": "...",
   "passed": true,                       // 历史检验是否达标
-  "threshold": 0.487,                   // 概率阈值
+  "threshold": 0.487,                   // 各类型阈值中的最小值(兼容字段)
+  "patternThresholds": { "BOX_BREAKOUT": 0.52, "OVERSOLD_REBOUND": 0.48, "TREND_WAVE": 1.01, "OTHER": 0.61 },
+                                        // 每种启动类型各自的阈值,> 1 表示该类型不发信号
   "scoreLine": 60,
   "gate":  { "minListedDays": 120, "minAmount5": 3e7, "minRet1": 0.03, "minVolRatio": 1.8,
              "maxPriorRise20": 0.25, "requireUpClose": true, "excludeSt": true, "resumeCooldown": 5 },

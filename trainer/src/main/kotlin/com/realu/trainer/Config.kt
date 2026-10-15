@@ -103,25 +103,40 @@ class Config(private val props: Properties, val file: File?) {
     // ---- GBDT ----
     val gbdt: GbdtParams
         get() = GbdtParams(
-            rounds = int("gbdt.rounds", 600),
-            learningRate = dbl("gbdt.learningRate", 0.05),
-            maxLeaves = int("gbdt.maxLeaves", 31),
-            maxDepth = int("gbdt.maxDepth", 6),
-            minDataInLeaf = int("gbdt.minDataInLeaf", 200),
+            rounds = int("gbdt.rounds", 1000),
+            learningRate = dbl("gbdt.learningRate", 0.03),
+            maxLeaves = int("gbdt.maxLeaves", 15),
+            maxDepth = int("gbdt.maxDepth", 5),
+            minDataInLeaf = int("gbdt.minDataInLeaf", 500),
             minSumHessian = dbl("gbdt.minSumHessian", 1e-3),
-            lambdaL2 = dbl("gbdt.lambdaL2", 1.0),
-            rowSample = dbl("gbdt.rowSample", 0.8),
-            featureSample = dbl("gbdt.featureSample", 0.8),
-            earlyStopping = int("gbdt.earlyStopping", 50),
-            maxBins = int("gbdt.maxBins", 64).coerceIn(4, 255),
+            lambdaL2 = dbl("gbdt.lambdaL2", 5.0),
+            rowSample = dbl("gbdt.rowSample", 0.7),
+            featureSample = dbl("gbdt.featureSample", 0.6),
+            earlyStopping = int("gbdt.earlyStopping", 100),
+            maxBins = int("gbdt.maxBins", 64).coerceIn(4, 250),
             positiveWeight = dbl("gbdt.positiveWeight", 1.0),
             seed = seed,
+            earlyStopMetric = str("gbdt.earlyStopMetric", "auc"),
+            evalEvery = int("gbdt.evalEvery", 5).coerceAtLeast(1),
         )
+
+    /** 按交易日平衡样本权重:sqrt(默认,权重 ∝ 1/√当日样本数)/ equal(每日总权重相同)/ none。 */
+    val dateBalance: String get() = str("gbdt.dateBalance", "sqrt").lowercase()
+    /** 自动比较"全部特征"与"去掉全市场类特征"等方案,按验证集 AUC 选优。 */
+    val groupSelect: Boolean get() = bool("gbdt.groupSelect", true)
+    /** 测试期按年滚动重训(每年用之前的全部数据训练),更接近实盘的定期重训。 */
+    val walkForward: Boolean get() = bool("eval.walkForward", true)
+    /** 导出前用全部已有数据(含验证、测试期)重训一次,APP 拿到的是"见过最新行情"的模型。 */
+    val refitAll: Boolean get() = bool("model.refitAll", true)
+    /** 每种启动类型单独选阈值。 */
+    val perPatternThreshold: Boolean get() = bool("eval.perPatternThreshold", true)
 
     // ---- 达标线 ----
     val targetPrecision: Double get() = dbl("target.precision", 0.95)
     val minValidSignals: Int get() = int("target.minValidSignals", 30)
     val minTestSignals: Int get() = int("target.minTestSignals", 30)
+    /** 每种启动类型在验证期至少要有的信号数。 */
+    val minPatternSignals: Int get() = int("target.minPatternSignals", 15)
 
     // ---- 回测 ----
     val maxPositions: Int get() = int("backtest.maxPositions", 5)

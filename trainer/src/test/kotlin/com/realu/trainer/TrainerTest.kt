@@ -72,9 +72,35 @@ class TrainerTest {
         val lp = com.realu.core.strategy.LabelParams()
         val st = TradeStats(sel, 0, lp)
         assertEquals(0.5, st.precision)
-        val choice = Selector.select(sorted, listOf(com.realu.core.strategy.ExitRule()), lp, 0.95, 1, 20, "precision", 99991231)
+        val choice = Selector.select(sorted, listOf(com.realu.core.strategy.ExitRule()), lp, 0.95, 1, 1, 20, "precision", 99991231)
         assertTrue(choice.achieved)
-        assertEquals(0.9, choice.threshold) // 阈值 0.9 排除失败的那只:1/1 达标;0.85 时只有 1/2
+        // 阈值 0.9 排除失败的那只:1/1 达标;0.85 时只有 1/2;其他类型没有候选 → 不启用
+        assertEquals(0.9, choice.threshold(com.realu.core.strategy.Pattern.OTHER))
+        assertTrue(!choice.enabled(com.realu.core.strategy.Pattern.BOX_BREAKOUT))
+    }
+
+    @Test
+    fun perPatternThresholdsAndFallback() {
+        val P = com.realu.core.strategy.Pattern.entries
+        // 超跌反弹 8 成功 / 2 失败;箱体突破 2 成功 / 8 失败:各自选阈值,弱的类型不应拖低整体
+        var bar = 0
+        fun mk(stock: Int, pat: com.realu.core.strategy.Pattern, prob: Double, ok: Boolean) = Candidate(
+            stock, "s$stock", "", 20200101 + bar, bar++, prob, pat, true, 10f, floatArrayOf(if (ok) 0.35f else -0.1f), shortArrayOf(5),
+            byteArrayOf(com.realu.core.strategy.ExitReason.TAKE_PROFIT.ordinal.toByte()), IntArray(10) { 20200102 + it }, FloatArray(10) { 10f })
+        val c = (0 until 10).map { mk(it, P[1], 0.6 + it * 0.01, it >= 2) } + (0 until 10).map { mk(100 + it, P[0], 0.7 + it * 0.01, it >= 8) }
+        val sorted = c.sortedWith(compareBy<Candidate> { it.date }.thenByDescending { it.prob })
+        val lp = com.realu.core.strategy.LabelParams()
+        val sel = Selector.select(sorted, listOf(com.realu.core.strategy.ExitRule()), lp, 0.95, 5, 3, 20, "precision", 99991231)
+        // 超跌反弹最高的 8 个全部成功 → 达标;箱体突破最多 2/2 不够 3 个信号 → 不启用
+        assertTrue(sel.achieved)
+        assertTrue(sel.enabled(P[1]))
+        assertTrue(!sel.enabled(P[0]))
+        assertEquals(1.0, sel.stats.precision)
+        // 分位数迁移:新模型概率整体变小,也能选出同样比例
+        val probs = doubleArrayOf(0.1, 0.2, 0.3, 0.4); val pats = ByteArray(4) { 1 }
+        val fr = doubleArrayOf(-1.0, 0.5, -1.0, -1.0)
+        assertEquals(0.3, ThresholdMapper.map(fr, probs, pats)[1])
+        assertTrue(ThresholdMapper.map(fr, probs, pats)[0] > 1.0)
     }
 
     @Test

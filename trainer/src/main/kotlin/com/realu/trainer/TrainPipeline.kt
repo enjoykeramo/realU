@@ -12,6 +12,12 @@ import java.time.format.DateTimeFormatter
 import java.util.Random
 import kotlin.math.roundToInt
 
+/** 一个特征方案的训练结果(特征组筛选)。 */
+class VariantResult(val name: String, val excludedGroups: Set<FeatureGroup>, val aucValid: Double, val bestRound: Int)
+
+/** 滚动重训的一年。 */
+class WalkYear(val year: Int, val trainRows: Int, val thresholds: DoubleArray, val stats: TradeStats)
+
 /** 报告所需的全部结果。 */
 class EvalSummary(
     val baseRate: Double,
@@ -19,8 +25,11 @@ class EvalSummary(
     val aucTest: Double,
     val rules: List<ExitRule>,
     val selection: Selection,
+    val validCandidates: List<Candidate>,
     val validSignals: List<Candidate>,
     val testSignals: List<Candidate>,
+    /** 测试期候选只算了选定的卖出规则,规则下标与验证期不同。 */
+    val testRuleIdx: Int,
     val testStats: TradeStats,
     val portfolio: PortfolioResult,
     val testFrom: Int,
@@ -29,6 +38,11 @@ class EvalSummary(
     val passed: Boolean,
     val marketSnapshot: Map<String, Float>,
     val sectorSource: String,
+    val variants: List<VariantResult>,
+    val chosenVariant: VariantResult,
+    val walkYears: List<WalkYear>,
+    val exportNote: String,
+    val dateBalance: String,
 )
 
 /**
@@ -80,88 +94,173 @@ class TrainPipeline(private val cfg: Config, private val runDir: File) {
         val baseRate = trainIdx.count { ds.label[it] > 0 }.toDouble() / trainIdx.size
         Console.info("基准成功率(候选启动日不经模型筛选):${pct(baseRate)} —— 模型的价值在于把它提高到多少")
 
-        // ---------- 训练 ----------
-        val trainer = GbdtTrainer(ds, binner, cfg.gbdt, cfg.threads)
-        val tr = try {
-            trainer.train(trainIdx, validIdx) { Console.info(it) }
-        } catch (e: OutOfMemoryError) {
-            throw IllegalStateException("训练时内存不足:请调大 -Xmx,或调小 sample.maxRows / sample.negativeKeep / gbdt.maxBins", e)
+        // ---------- 训练:按交易日平衡样本权重 + 特征组筛选 ----------
+        val weights = dateWeights(ds, cfg.dateBalance)
+        val yValid = IntArray(validIdx.size) { ds.label[validIdx[it]].toInt() }
+        val yTest = IntArray(testIdx.size) { ds.label[testIdx[it]].toInt() }
+        val marketWide = setOf(FeatureGroup.MARKET, FeatureGroup.SENTIMENT)
+        val plans = buildList {
+            add("全部特征" to emptySet<FeatureGroup>())
+            if (cfg.groupSelect) {
+                add("去掉全市场类(市场环境+市场情绪)" to marketWide)
+                if (sectors?.hasConcepts == true) add("去掉全市场类与概念" to marketWide + FeatureGroup.CONCEPT)
+            }
         }
-        val pValid = trainer.predict(validIdx)
-        val pTest = trainer.predict(testIdx)
-        trainer.close()
-        val aucValid = Metrics.auc(pValid, IntArray(validIdx.size) { ds.label[validIdx[it]].toInt() })
-        val aucTest = if (testIdx.isNotEmpty()) Metrics.auc(pTest, IntArray(testIdx.size) { ds.label[testIdx[it]].toInt() }) else Double.NaN
-        Console.info("AUC:验证 ${"%.4f".format(aucValid)},测试 ${"%.4f".format(aucTest)}")
+        val variants = ArrayList<VariantResult>()
+        var best: Triple<VariantResult, TrainResult, Pair<DoubleArray, DoubleArray>>? = null
+        var bestMask = BooleanArray(FeatureDefs.COUNT)
+        for ((name, groups) in plans) {
+            Console.info("—— 特征方案:$name ——")
+            val mask = BooleanArray(FeatureDefs.COUNT) { FeatureDefs.ALL[it].group in groups }
+            val trainer = GbdtTrainer(ds, binner, cfg.gbdt.copy(excluded = mask), cfg.threads, weights)
+            val tr = try {
+                trainer.train(trainIdx, validIdx) { Console.info(it) }
+            } catch (e: OutOfMemoryError) {
+                trainer.close()
+                throw IllegalStateException("训练时内存不足:请调大 -Xmx,或调小 sample.maxRows / sample.negativeKeep / gbdt.maxBins", e)
+            }
+            val pv = trainer.predict(validIdx)
+            val pt = trainer.predict(testIdx)
+            trainer.close()
+            val auc = Metrics.auc(pv, yValid)
+            val v = VariantResult(name, groups, auc, tr.bestRound)
+            variants += v
+            Console.info("特征方案「$name」验证 AUC ${"%.4f".format(auc)}(${tr.bestRound} 棵树)")
+            if (best == null || auc > best.first.aucValid) { best = Triple(v, tr, pv to pt); bestMask = mask }
+        }
+        val (chosen, tr, preds) = best!!
+        val (pValid, pTest) = preds
+        val params = cfg.gbdt.copy(excluded = bestMask)
+        val aucValid = chosen.aucValid
+        val aucTest = if (testIdx.isNotEmpty()) Metrics.auc(pTest, yTest) else Double.NaN
+        Console.info("选用特征方案「${chosen.name}」;AUC:验证 ${"%.4f".format(aucValid)},测试(同一模型)${"%.4f".format(aucTest)}")
+        if (aucValid < 0.56) Console.warn("验证 AUC 很低(${"%.3f".format(aucValid)}):现有特征对该目标的预测力很弱,95% 准确率不现实,建议调整目标或候选条件")
 
-        // ---------- 一次扫描验证期 + 测试期 ----------
+        // ---------- 验证期:扫描候选,同时选卖出规则与各类型阈值 ----------
         val rules = if (cfg.exitGrid) CandidateScanner.grid(label, cfg.exit) else listOf(cfg.exit)
         val minProb = Metrics.quantile(pValid, 1 - cfg.dbl("eval.candidateTop", 0.15))
-        val scanner = CandidateScanner(source, stocks, index, market, cfg.gate, rules, cfg.threads)
         val validFrom = Dates.plusDays(cfg.trainEnd, 1)
         val testFrom = Dates.plusDays(cfg.validEnd, 1)
-        val all = scanner.run(tr.model, minProb, validFrom, cfg.testEnd) { Console.info(it) }
-        val validCands = all.filter { it.date <= cfg.validEnd }
-        val testCands = all.filter { it.date > cfg.validEnd }
-        Console.info("候选信号:验证期 ${validCands.size},测试期 ${testCands.size}(概率 ≥ ${"%.4f".format(minProb)},${rules.size} 组卖出规则)")
-
-        // ---------- 验证期:同时选卖出规则与阈值 ----------
+        val validCands = CandidateScanner(source, stocks, index, market, cfg.gate, rules, cfg.threads)
+            .run(tr.model, minProb, validFrom, cfg.validEnd) { Console.info(it) }
+        Console.info("验证期候选信号 ${validCands.size}(概率 ≥ ${"%.4f".format(minProb)},${rules.size} 组卖出规则)")
         val cooldown = cfg.int("backtest.cooldownDays", 20)
         val objective = cfg.str("exit.objective", "precision").lowercase()
-        val sel = Selector.select(validCands, rules, label, cfg.targetPrecision, cfg.minValidSignals, cooldown, objective, cfg.validEnd)
+        val sel = Selector.select(validCands, rules, label, cfg.targetPrecision, cfg.minValidSignals, cfg.minPatternSignals,
+            cooldown, objective, cfg.validEnd, cfg.perPatternThreshold)
         val rule = rules[sel.ruleIdx]
-        Console.info("验证期选定:阈值 ${"%.4f".format(sel.threshold)};卖出规则 ${rule.describe()}")
-        Console.info("验证期:信号 ${sel.stats.n},成功 ${sel.stats.hits},准确率 ${pct(sel.stats.precision)}" +
-            if (sel.achieved) "(达到目标 ${pct(cfg.targetPrecision)})" else "(未达到目标 ${pct(cfg.targetPrecision)},取验证期最高准确率)")
+        Console.info("验证期选定卖出规则:${rule.describe()}")
+        for (p in Pattern.entries) {
+            val st = sel.perPattern[p]
+            Console.info("  ${p.label}:" + if (!sel.enabled(p)) "不启用" else "阈值 ${"%.4f".format(sel.threshold(p))},信号 ${st?.n},准确率 ${pct(st?.precision ?: 0.0)}")
+        }
+        Console.info("验证期合计:信号 ${sel.stats.n},成功 ${sel.stats.hits},准确率 ${pct(sel.stats.precision)}(95%下限 ${pct(sel.stats.lower95)})" +
+            if (sel.achieved) ",达到目标" else ",未达到目标 ${pct(cfg.targetPrecision)}")
+        val validPatterns = ByteArray(validIdx.size) { ds.pattern[validIdx[it]] }
+        val fractions = ThresholdMapper.fractions(sel, pValid, validPatterns)
+        val rounds = maxOf(50, (tr.bestRound * 1.1).toInt())
+        val lastDate = maxOf(index?.series?.date?.last() ?: 0, ds.date.maxOrNull() ?: 0)
+        val testTo0 = minOf(cfg.testEnd, lastDate)
 
-        // ---------- 测试期检验 ----------
-        val validSignals = Selector.dedupe(validCands, sel.threshold, cooldown)
-        val testSignals = Selector.dedupe(testCands, sel.threshold, cooldown)
-        val ts = TradeStats(testSignals, sel.ruleIdx, label)
+        // ---------- 测试期:按年滚动重训(或沿用验证模型) ----------
+        val testScanner = CandidateScanner(source, stocks, index, market, cfg.gate, listOf(rule), cfg.threads)
+        val walkYears = ArrayList<WalkYear>()
+        val testSignals: List<Candidate>
+        if (cfg.walkForward && testFrom <= testTo0) {
+            val segs = ArrayList<CandidateScanner.Segment>()
+            val yearTh = ArrayList<Pair<Int, DoubleArray>>()
+            val yearRows = HashMap<Int, Int>()
+            for (y in testFrom / 10000..testTo0 / 10000) {
+                val y0 = y * 10000 + 101
+                val trainY = ds.date.indices.filter { ds.endDate[it] < y0 }.toIntArray()
+                val refY = ds.date.indices.filter { ds.date[it] >= y0 - 10000 && ds.date[it] < y0 }.toIntArray()
+                Console.info("滚动重训 $y 年:训练样本 ${trainY.size}(标签在 $y 年之前结束),$rounds 棵树")
+                val (mY, pRef) = fitFixed(ds, binner, params, weights, trainY, refY, rounds)
+                val th = ThresholdMapper.map(fractions, pRef, ByteArray(refY.size) { ds.pattern[refY[it]] })
+                segs += CandidateScanner.Segment(mY, th.minOrNull() ?: 1.0, maxOf(y0, testFrom), minOf(y * 10000 + 1231, testTo0))
+                yearTh += y to th
+                yearRows[y] = trainY.size
+            }
+            val cands = testScanner.run(segs) { Console.info(it) }
+            val thOf = { c: Candidate -> yearTh.first { it.first == c.date / 10000 }.second[c.pattern.ordinal] }
+            testSignals = Selector.dedupe(cands, thOf, cooldown)
+            for ((y, th) in yearTh) walkYears += WalkYear(y, yearRows.getValue(y), th, TradeStats(testSignals.filter { it.date / 10000 == y }, 0, label))
+        } else {
+            val cands = testScanner.run(tr.model, sel.minThreshold, testFrom, cfg.testEnd) { Console.info(it) }
+            testSignals = Selector.dedupe(cands, { c -> sel.threshold(c.pattern) }, cooldown)
+        }
+        val validSignals = Selector.dedupe(validCands, sel, cooldown)
+        val ts = TradeStats(testSignals, 0, label)
         val testTo = testSignals.maxOfOrNull { it.date } ?: testFrom
-        val portfolio = Portfolio.simulate(testSignals, sel.ruleIdx, cfg.maxPositions, cfg.costPerTrade, testFrom)
+        val portfolio = Portfolio.simulate(testSignals, 0, cfg.maxPositions, cfg.costPerTrade, testFrom)
         val passed = sel.achieved && ts.n >= cfg.minTestSignals && ts.precision >= cfg.targetPrecision
         val verdict = when {
             passed -> "达标"
-            !sel.achieved -> "未达标:验证期在信号数 ≥ ${cfg.minValidSignals} 的前提下最高准确率只有 ${pct(sel.stats.precision)}"
+            !sel.achieved -> "未达标:验证期在信号数足够的前提下,准确率达不到 ${pct(cfg.targetPrecision)}(最优配置 ${pct(sel.stats.precision)},95%下限 ${pct(sel.stats.lower95)})"
             ts.n < cfg.minTestSignals -> "未达标:测试期已完成信号 ${ts.n} 个 < ${cfg.minTestSignals},统计上不可信"
             else -> "未达标:测试期准确率 ${pct(ts.precision)} < 目标 ${pct(cfg.targetPrecision)}"
         }
-        val lastDate = index?.series?.date?.last() ?: testTo
-        val summary = EvalSummary(baseRate, aucValid, aucTest, rules, sel, validSignals, testSignals, ts, portfolio,
-            testFrom, testTo, verdict, passed, market.marketAt(lastDate), sectors?.source ?: "none")
 
-        // ---------- 导出 ----------
-        val weights = factorWeights(tr.gainImportance)
+        // ---------- 导出模型:用全部数据重训 ----------
+        var exportModel = tr.model
+        var exportTh = sel.thresholds
+        var importance = tr.gainImportance
+        val exportNote: String
+        if (cfg.refitAll) {
+            val all = ds.date.indices.toList().toIntArray()
+            val ref = ds.date.indices.filter { ds.date[it] >= lastDate - 10000 }.toIntArray()
+            Console.info("导出模型:用全部 ${all.size} 个样本重训($rounds 棵树)")
+            val trainer = GbdtTrainer(ds, binner, params.copy(rounds = rounds), cfg.threads, weights)
+            val trF = trainer.train(all, IntArray(0)) { Console.info(it) }
+            val pRef = trainer.predict(ref)
+            trainer.close()
+            exportModel = trF.model
+            importance = trF.gainImportance
+            exportTh = ThresholdMapper.map(fractions, pRef, ByteArray(ref.size) { ds.pattern[ref[it]] })
+            exportNote = "导出模型用全部已有数据(${Dates.format(cfg.startDate)} ~ ${Dates.format(lastDate)},${all.size} 个样本)重训,阈值按最近一年候选的分位数迁移"
+        } else {
+            exportNote = "导出模型即验证期模型(训练数据截至 ${Dates.format(cfg.trainEnd)})"
+        }
+        val lastDateMkt = index?.series?.date?.last() ?: testTo
+        val summary = EvalSummary(baseRate, aucValid, aucTest, rules, sel, validCands, validSignals, testSignals, 0, ts, portfolio,
+            testFrom, testTo, verdict, passed, market.marketAt(lastDateMkt), sectors?.source ?: "none",
+            variants, chosen, walkYears, exportNote, cfg.dateBalance)
+
+        val weightsByGroup = factorWeights(importance)
         val metrics = linkedMapOf<String, Any?>(
             "verdict" to verdict,
             "definition" to "准确率 = 已完成交易周期中,按卖出规则卖出时(收盘价)扣成本盈利 ≥ ${pct(label.target, 0)} 的比例;同股 $cooldown 日内只计一次",
             "target" to label.describe(),
             "baseRate" to baseRate,
             "aucValid" to aucValid, "aucTest" to aucTest,
+            "featurePlan" to chosen.name,
             "valid" to statsMap(sel.stats),
-            "test" to statsMap(ts) + mapOf("from" to testFrom, "to" to testTo),
+            "test" to statsMap(ts) + mapOf("from" to testFrom, "to" to testTo, "walkForward" to cfg.walkForward),
             "portfolio" to linkedMapOf("slots" to cfg.maxPositions, "finalEquity" to portfolio.finalEquity,
                 "annualized" to portfolio.annualized, "maxDrawdown" to portfolio.maxDrawdown, "trades" to portfolio.taken),
             "byPattern" to Pattern.entries.associate { p ->
-                val st = TradeStats(testSignals.filter { it.pattern == p }, sel.ruleIdx, label)
-                p.label to linkedMapOf("signals" to st.n, "precision" to st.precision)
+                val st = TradeStats(testSignals.filter { it.pattern == p }, 0, label)
+                p.label to linkedMapOf("enabled" to sel.enabled(p), "signals" to st.n, "precision" to st.precision)
             },
+            "export" to exportNote,
         )
         val stamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd-HHmm"))
+        val enabledTh = exportTh.filter { it <= 1.0 }
         val model = RealuModel(
             name = cfg.modelName, strategyId = cfg.strategyId,
             createdAt = LocalDateTime.now().toString(),
             featureVersion = FeatureDefs.VERSION, featureNames = FeatureDefs.NAMES,
-            gate = cfg.gate, label = label, exit = rule, gbdt = tr.model,
-            threshold = sel.threshold, passed = passed, metrics = metrics, factorWeights = weights,
+            gate = cfg.gate, label = label, exit = rule, gbdt = exportModel,
+            threshold = enabledTh.minOrNull() ?: Selector.DISABLED, passed = passed, metrics = metrics, factorWeights = weightsByGroup,
             dataInfo = linkedMapOf(
                 "source" to cfg.dataSource, "stocks" to stats.stocksOk, "samples" to ds.size,
-                "startDate" to cfg.startDate, "trainEnd" to cfg.trainEnd, "validEnd" to cfg.validEnd,
+                "startDate" to cfg.startDate, "trainEnd" to cfg.trainEnd, "validEnd" to cfg.validEnd, "lastDate" to lastDate,
                 "sectorSource" to (sectors?.source ?: "none"), "concepts" to (sectors?.conceptNames?.size ?: 0),
-                "floatShares" to source.hasFloatShares, "index" to cfg.indexSymbol, "trees" to tr.model.trees.size,
+                "floatShares" to source.hasFloatShares, "index" to cfg.indexSymbol, "trees" to exportModel.trees.size,
+                "featurePlan" to chosen.name, "refitAll" to cfg.refitAll,
             ),
             sectors = sectors?.latest(),
+            patternThresholds = Pattern.entries.associate { it.name to exportTh[it.ordinal] },
         )
         val modelFile = File(runDir, "model-$stamp" + (if (passed) "" else "-NOT-PASSED") + ".json") // 文件名只用 ASCII,避免系统编码不一致时出现乱码文件名
         modelFile.writeText(model.toJson(), Charsets.UTF_8)
@@ -169,14 +268,15 @@ class TrainPipeline(private val cfg: Config, private val runDir: File) {
         RealuModel.fromJson(modelFile.readText(Charsets.UTF_8)).checkCompatible()
 
         writeSignals(File(runDir, "signals_valid.csv"), validSignals, sel.ruleIdx)
-        writeSignals(File(runDir, "signals_test.csv"), testSignals, sel.ruleIdx)
-        writeImportance(File(runDir, "feature_importance.csv"), tr.gainImportance)
+        writeSignals(File(runDir, "signals_test.csv"), testSignals, 0)
+        writeImportance(File(runDir, "feature_importance.csv"), importance)
         Report.write(File(runDir, "report.md"), cfg, model, summary)
 
         Console.raw("")
         Console.raw("================ 结果 ================")
         Console.raw("目标:${label.describe()}")
-        Console.raw("测试期 ${Dates.format(testFrom)} ~ ${Dates.format(testTo)}(训练与调参从未使用)")
+        Console.raw("特征方案:${chosen.name};验证 AUC ${"%.4f".format(aucValid)}")
+        Console.raw("测试期 ${Dates.format(testFrom)} ~ ${Dates.format(testTo)}(" + (if (cfg.walkForward) "按年滚动重训," else "") + "从未参与任何选择)")
         Console.raw("已完成信号 ${ts.n} 个,成功 ${ts.hits} 个,准确率 ${pct(ts.precision)}(95%置信下限 ${pct(ts.lower95)});持仓中未完成 ${ts.incomplete} 个")
         Console.raw("卖出规则:${rule.describe()}")
         Console.raw("平均收益 ${pct(ts.mean)},中位数 ${pct(ts.median)},胜率 ${pct(ts.winRate)},最差 ${pct(ts.worst)}")
@@ -186,6 +286,30 @@ class TrainPipeline(private val cfg: Config, private val runDir: File) {
         Console.raw("报告:${File(runDir, "report.md").absolutePath}")
         Console.raw("耗时 ${(System.currentTimeMillis() - t0) / 1000} 秒")
         return passed
+    }
+
+    /** 固定轮数训练(滚动重训、最终重训用),返回模型与参考样本的预测。 */
+    private fun fitFixed(ds: Dataset, binner: Binner, params: GbdtParams, weights: FloatArray?, rows: IntArray, ref: IntArray,
+                         rounds: Int): Pair<com.realu.core.model.GbdtModel, DoubleArray> {
+        val trainer = GbdtTrainer(ds, binner, params.copy(rounds = rounds), cfg.threads, weights)
+        try {
+            val t = trainer.train(rows, IntArray(0)) { Console.info(it) }
+            return t.model to trainer.predict(ref)
+        } finally {
+            trainer.close()
+        }
+    }
+
+    /** 按交易日平衡的样本权重,平均值归一为 1。 */
+    private fun dateWeights(ds: Dataset, mode: String): FloatArray? {
+        if (mode == "none") return null
+        val count = HashMap<Int, Int>()
+        for (d in ds.date) count.merge(d, 1, Int::plus)
+        val w = FloatArray(ds.size) { val c = count.getValue(ds.date[it]).toDouble(); (if (mode == "equal") 1 / c else 1 / Math.sqrt(c)).toFloat() }
+        val mean = w.average().toFloat()
+        for (i in w.indices) w[i] /= mean
+        Console.info("样本权重按交易日平衡($mode):单日候选最多 ${count.values.maxOrNull()} 个、中位数 ${count.values.sorted()[count.size / 2]} 个")
+        return w
     }
 
     private fun statsMap(st: TradeStats) = linkedMapOf<String, Any?>(
